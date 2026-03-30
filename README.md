@@ -95,9 +95,31 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 
 ## Serialization Notes
 
-`imComp.txt` uses command-style records such as:
-- `C;...;` for color entries
-- `L;...;` for loop/polyline geometry
-- `B;...;` for Bezier-related geometry
+imComp.txt record format (per region)
 
-This format has been kept readable during development to support debugging and iterative refinement.
+C;L,a,b;
+
+Mean region color in LAB (integer values).
+M;a0,a1,a2;b0,b1,b2;c0,c1,c2;
+
+Planar LAB model coefficients, one triple per channel.
+Model: value(x,y) = a + b*x + c*y.
+S;k;knots;ctrl_row;ctrl_col;
+
+Spline boundary record.
+k: spline degree (integer).
+knots: comma-separated knot vector.
+ctrl_row: comma-separated row control points.
+ctrl_col: comma-separated column control points.
+L;r,c;r,c;...;
+
+Fallback loop/polyline boundary record.
+Sequence of sampled contour points as row/column pairs.
+Parsing and grouping rules
+
+Fields are separated by semicolons (;).
+Numeric tuples/lists inside a field are comma-separated (,).
+A region is stored as:
+C + M + (S or L)
+followed by a blank line.
+S is preferred; L is used when spline fitting fails.
