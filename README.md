@@ -5,7 +5,7 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 
 ## Repository Layout
 
-- `v1.0funcCompress.ipynb` to `v4.0FuncCompress.ipynb`: main versioned notebooks.
+- `v1.0funcCompress.ipynb` to `v6.0FuncCompress.ipynb`: main versioned notebooks.
 - `pics/`: input images used for testing.
 - `Results/`: reconstructed output examples.
 - `imComp.txt`: serialized geometry/color output used for debugging and reconstruction.
