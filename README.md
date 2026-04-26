@@ -83,7 +83,22 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 
 ### v6.0 Integrated B-Spline, Painter's, and Fallback Path
 - **Current file:** `v6.0FuncCompress.ipynb`
-- 
+- Saved known good file, reviewed last by Dr. Town
+
+### v7.0 Integrated B-Spline, Painter's, and Fallback Path
+- **Current file:** `v6.0FuncCompress.ipynb`
+- Fixed repair_coverage function to fix bug of returning too early
+- Updated spline decoding to use adaptive perimeter-based sampling (n_samples scaled by estimated contour arc length and control-point count) so large S contours are reconstructed smoothly instead of being under-sampled.
+- Updated Painter’s ordering to sort decoded regions by true polygon area (cv2.contourArea) instead of contour point count, improving overlap/occlusion robustness during reconstruction.
+- Replaced fixed-stride contour downsampling in spline fitting with full-contour fitting and splprep smoothing (s>0), enabling adaptive control-point allocation and better size–quality tradeoffs.
+- Updated segmentation similarity to use Euclidean distance in standard-like CIELAB space (OpenCV LAB remapped to L*∈[0,100], a*,b* centered at 0), replacing /255 channel normalization with an approximately ΔE-interpretable threshold. (HUGE IMPROVEMENT)
+- Unified region connectivity to 8-neighborhood throughout segmentation and contour extraction (CCL, border detection, and tracing) to remove diagonal-connectivity mismatches and reduce subtle boundary artifacts.
+- Removed redundant mean-color storage by eliminating C records and using M (planar coefficients) as the sole region header and color model source during decoding.
+- Implemented thresh (segmentation) adaptive hyperparameter: compute an image-level complexity score from local LAB variability (e.g., median local std over 5x5/7x7). Higher complexity -> lower thresh; lower complexity -> higher thresh.
+- Implemented contour-adaptive spline smoothing by deriving splprep’s s per boundary from geometric complexity (perimeter, turn-angle statistics, and corner density), using lower s for sharp/corner-rich contours and higher s for smoother/longer contours.
+- Replaced the previous nested-loop coverage repair with a vectorized post-fill method using scipy.ndimage.binary_dilation and convolve to identify adjacent unpainted pixels and fill them by averaging painted neighbors. Added a nearest-painted-pixel fallback (distance_transform_edt) that activates only when needed, ensuring full reconstruction coverage and removing remaining white gaps.
+
+
 
 ## Technical Progression Summary
 
