@@ -85,8 +85,8 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 - **Current file:** `v6.0FuncCompress.ipynb`
 - Saved known good file, reviewed last by Dr. Town
 
-### v7.0 Integrated B-Spline, Painter's, and Fallback Path
-- **Current file:** `v6.0FuncCompress.ipynb`
+### v7.0 Completed several bug fixes, updated painter's sort algorithm, replaced fixed stride downsampling, updated segmentation similarity, region connectivity --> 8, removed redundant mean color, adaptive thresh and spline_smooth, fixed repair_coverage
+- **Current file:** `v7.0FuncCompress.ipynb`
 - Fixed repair_coverage function to fix bug of returning too early
 - Updated spline decoding to use adaptive perimeter-based sampling (n_samples scaled by estimated contour arc length and control-point count) so large S contours are reconstructed smoothly instead of being under-sampled.
 - Updated Painter’s ordering to sort decoded regions by true polygon area (cv2.contourArea) instead of contour point count, improving overlap/occlusion robustness during reconstruction.
@@ -98,7 +98,9 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 - Implemented contour-adaptive spline smoothing by deriving splprep’s s per boundary from geometric complexity (perimeter, turn-angle statistics, and corner density), using lower s for sharp/corner-rich contours and higher s for smoother/longer contours.
 - Replaced the previous nested-loop coverage repair with a vectorized post-fill method using scipy.ndimage.binary_dilation and convolve to identify adjacent unpainted pixels and fill them by averaging painted neighbors. Added a nearest-painted-pixel fallback (distance_transform_edt) that activates only when needed, ensuring full reconstruction coverage and removing remaining white gaps.
 
-
+### v7.1 Integrated Thin Dark Stroke and local hybrid DCT encoding
+- **Current file:** `v7.1FuncCompress.ipynb`
+- Separated into new file to save progress prior to implementing "thin dark stroke" and local hybrid DCT encoding, which both change the imComp.txt schema
 
 ## Technical Progression Summary
 
