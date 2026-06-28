@@ -98,9 +98,29 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 - Implemented contour-adaptive spline smoothing by deriving splprep’s s per boundary from geometric complexity (perimeter, turn-angle statistics, and corner density), using lower s for sharp/corner-rich contours and higher s for smoother/longer contours.
 - Replaced the previous nested-loop coverage repair with a vectorized post-fill method using scipy.ndimage.binary_dilation and convolve to identify adjacent unpainted pixels and fill them by averaging painted neighbors. Added a nearest-painted-pixel fallback (distance_transform_edt) that activates only when needed, ensuring full reconstruction coverage and removing remaining white gaps.
 
-### v7.1 Integrated Thin Dark Stroke and local hybrid DCT encoding
+### v7.1 Local hybrid DCT encoding and Floating to Fixed point quantization → Delta coding → Binary serialization → Entropy coding
 - **Current file:** `v7.1FuncCompress.ipynb`
-- Separated into new file to save progress prior to implementing "thin dark stroke" and local hybrid DCT encoding, which both change the imComp.txt schema
+- Per-region DCT residual with m_k flag serialized to file
+- Local rate-distortion metric for planar-only vs. planar+DCT decision (distinct from segmentation threshold)
+- Replace floating-point coefficients with fixed-point/scaled integers
+- Apply delta coding to coefficients before entropy coding
+- Binary serialization of full record structure with actual byte counts
+- Entropy coding applied to binary format (Huffman sufficient; arithmetic coding deferred to future work)
+- S/L encoding ratio check per image (instrumented in encoding loop)
+
+### v7.2 Copied v5.0 and updated to match v7.1 advances and following changes
+- **Current file:** `v7.2FuncCompress.ipynb`
+- Add LPIPS and MSE to ablation notebook
+- Align with v7.0 pipeline (8-connected segmentation, same pixel set across all six conditions)
+- Bugs Bunny ablation: C vs. F results and polyline fallback percentage
+- Adaptive smoothing parameter ablation
+- sigmaColor x threshold interaction grid
+- Acquire and prepare standard datasets (Kodak, BSDS500, structured graphics set)
+- Define validation/test split; tune all hyperparameters on validation set only
+
+### v7.3 Copied v5.1 and updated to match v7.1 advances and following changes
+- **Current file:** `v7.3FuncCompress.ipynb`
+- Verify matched parameter budgets for B-spline vs. Bezier comparison
 
 ## Technical Progression Summary
 
