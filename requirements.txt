@@ -29,3 +29,9 @@ tornado==6.5.6
 traitlets==5.15.1
 typing_extensions==4.15.0
 wcwidth==0.8.0
+scikit-image==0.26.0
+numpy
+opencv-python
+matplotlib
+scipy
+pillow
