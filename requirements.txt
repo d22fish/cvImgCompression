@@ -36,3 +36,5 @@ matplotlib
 scipy
 pillow
 scikit-learn
+torch
+lpips
