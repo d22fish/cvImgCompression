@@ -38,3 +38,4 @@ pillow
 scikit-learn
 torch
 lpips
+math
