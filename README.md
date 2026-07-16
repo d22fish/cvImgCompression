@@ -122,6 +122,10 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 - **Current file:** `v7.3FuncCompress.ipynb`
 - Verify matched parameter budgets for B-spline vs. Bezier comparison
 
+### v7.4 Held out Validation Set Hyperparameter Tuning
+- **Current file:** `v7.4FuncCompress.ipynb`
+- Put everything inside functions and iterating through hyperparameter options
+
 ## Technical Progression Summary
 
 1. **Scalability:** moved away from brittle/global behavior toward component- and contour-oriented processing.
