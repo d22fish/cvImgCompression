@@ -125,6 +125,8 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 ### v7.4 Held out Validation Set Hyperparameter Tuning
 - **Current file:** `v7.4FuncCompress.ipynb`
 - Put everything inside functions and iterating through hyperparameter options
+- BSDS500: sigmaColor=190, sigmaSpace=145, high_thresh=28.0, low_thresh=10.5, smin=1.0, smax=4.5, bp=300.0, cw=(0.4, 0.6) (PSNR=28.38)
+- SVG: sigmaColor=85, sigmaSpace=120, high_thresh=18.0, low_thresh=0.0, smin=0.0, smax=9.0, bp=225.0, cw=(0.4, 0.6) (PSNR=42.55)
 
 ## Technical Progression Summary
 
