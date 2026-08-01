@@ -294,7 +294,7 @@ def write_loop_L(f, contour_pts, max_pts=120):
 
 # %%
 # contour_rc: list/array of points (closed or open), returns geometric complexity metrics for adaptive spline smoothing.
-def contour_complexity_metrics(contour_rc):
+def contour_complexity_metrics(contour_rc, complexity_weights=(0.6, 0.4)):
     pts = np.asarray(contour_rc, dtype=np.float64)
 
     if len(pts) < 5:
@@ -341,7 +341,7 @@ def contour_complexity_metrics(contour_rc):
     corner_density = float(np.mean(turns > corner_threshold))
 
     # Combined complexity score ~[0,1]
-    complexity = 0.6 * min(mean_turn / np.pi, 1.0) + 0.4 * corner_density
+    complexity = complexity_weights[0] * min(mean_turn / np.pi, 1.0) + complexity_weights[1] * corner_density
 
     return {
         "perimeter": perimeter,
@@ -352,8 +352,8 @@ def contour_complexity_metrics(contour_rc):
     }
 
 # Returns contour-adaptive splprep smoothing parameter s, Higher s: more smoothing/fewer control points, Lower s: tighter fit.
-def adaptive_spline_smooth(contour_rc, min_smooth=0.0, max_smooth=20.0, base_perimeter=200.0):
-    m = contour_complexity_metrics(contour_rc)
+def adaptive_spline_smooth(contour_rc, min_smooth=0.0, max_smooth=20.0, base_perimeter=200.0, complexity_weights=(0.6, 0.4)):
+    m = contour_complexity_metrics(contour_rc, complexity_weights)
 
     perimeter = m["perimeter"]
     complexity = m["complexity"]
@@ -794,7 +794,7 @@ def run_encode_decode(
 
             # Try spline first
             #tck = fit_closed_bspline(contour, smooth=SPLINE_SMOOTH, degree=3)
-            s_val, contour_metrics = adaptive_spline_smooth(contour, min_smooth=spline_min_smooth, max_smooth=spline_max_smooth, base_perimeter=spline_base_perim)
+            s_val, contour_metrics = adaptive_spline_smooth(contour, min_smooth=spline_min_smooth, max_smooth=spline_max_smooth, base_perimeter=spline_base_perim, complexity_weights=complexity_weights)
             tck = fit_closed_bspline(contour, smooth=s_val, degree=3)
             #print(f"s={s_val:.2f}, perim={contour_metrics['perimeter']:.1f}, complexity={contour_metrics['complexity']:.3f}")
 
