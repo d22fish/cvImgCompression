@@ -506,7 +506,7 @@ def fit_region_quadratic_model(img_color, region_mask):
     return coef, xc, yc
 
 # %%
-def check_int_cast(arr, scale, dtype, label, log=CAST_LOG):
+def check_int_cast(arr, scale, dtype, label, log):
     info = np.iinfo(dtype)
     scaled = np.round(np.asarray(arr, dtype=np.float64) * scale)
 
@@ -603,13 +603,13 @@ def rd_three_tier(img_lab, region_mask, coef_lin, xc, yc, coef_quad, dct_payload
 
     # tier 0: linear planar only
     recon_lin = reconstruct_region(coef_lin, region_mask, xc, yc)
-    D0 = float(np.mean((orig - recon_lin[ys, xs]) ** 2))
+    D0 = float(np.sum((orig - recon_lin[ys, xs]) ** 2))
     R0 = R_geom + 1 + 18
     J0 = D0 + lam * R0
 
     # tier 1: quadratic only
     recon_quad = reconstruct_region(coef_quad, region_mask, xc, yc)
-    D1 = float(np.mean((orig - recon_quad[ys, xs]) ** 2))
+    D1 = float(np.sum((orig - recon_quad[ys, xs]) ** 2))
     R1 = R_geom + 1 + 54
     J1 = D1 + lam * R1
 
@@ -634,7 +634,7 @@ def rd_three_tier(img_lab, region_mask, coef_lin, xc, yc, coef_quad, dct_payload
     recon_dct[r0:r0+H, c0:c0+W] += residual_hat[:H, :W]
     recon_dct = np.clip(recon_dct, 0, 255)
 
-    D2 = float(np.mean((orig - recon_dct[ys, xs]) ** 2))
+    D2 = float(np.sum((orig - recon_dct[ys, xs]) ** 2))
     R2 = R_geom + 1 + 18 + dct_payload['byte_cost']
     J2 = D2 + lam * R2
 
@@ -773,6 +773,8 @@ def run_encode_decode(
     fallback_ok = 0
     dropped = 0
     tier_counts = [0, 0, 0]
+    tier_pixel_counts = [0, 0, 0]
+    tier_byte_counts = [0, 0, 0]
     # overflow logging
     CAST_LOG = {}
     CAST_LOG.clear()
@@ -782,7 +784,8 @@ def run_encode_decode(
     huff_path = f"/tmp/imFullComp_{pid}.huff"
     with open(txt_path, "w") as f, open(bin_path, "wb") as fb:
         header_pos = fb.tell()
-        fb.write(struct.pack('<HHI', img.shape[0], img.shape[1], 0))
+        FORMAT_VERSION = 1
+        fb.write(struct.pack('<BBHHI', FORMAT_VERSION, rd_dct_quality, img.shape[0], img.shape[1], 0))
         for i in range(len(edgesSorted)):
             x = edgesSorted[i][0]
             y = edgesSorted[i][1]
@@ -850,10 +853,18 @@ def run_encode_decode(
                 dct_payload = encode_region_dct_residual(img, recon_lin, region_mask, quality=rd_dct_quality)
                 tier, _ = rd_three_tier(img, region_mask, coef, xc, yc, coef_quad, dct_payload, len(geom_bin), rd_lambda, quality=rd_dct_quality)
                 tier_counts[tier] += 1
+                ys_r, _ = np.where(region_mask)
+                tier_pixel_counts[tier] += len(ys_r)
+                if tier == 0:
+                    tier_byte_counts[tier] += 23 + len(geom_bin)
+                elif tier == 1:
+                    tier_byte_counts[tier] += 59 + len(geom_bin)
+                else:
+                    tier_byte_counts[tier] += 33 + len(geom_bin) + (dct_payload['byte_cost'] if dct_payload else 0)
                 xcQ, ycQ = int(round(xc)), int(round(yc))
 
                 if tier == 0:
-                    coefQ = check_int_cast(coef, 100, np.int16, "M.linear.tier0")
+                    coefQ = check_int_cast(coef, 100, np.int16, "M.linear.tier0", CAST_LOG)
                     m0 = ",".join(str(v) for v in coefQ[0])
                     m1 = ",".join(str(v) for v in coefQ[1])
                     m2 = ",".join(str(v) for v in coefQ[2])
@@ -863,8 +874,8 @@ def run_encode_decode(
                     fb.write(coefQ.astype('<i2').tobytes())
 
                 elif tier == 1:
-                    coefQ_lin = check_int_cast(coef_quad[:, :3], 100,   np.int16, "M.quad.linear")
-                    coefQ_sec = check_int_cast(coef_quad[:, 3:], 10000, np.int32, "M.quad.second")
+                    coefQ_lin = check_int_cast(coef_quad[:, :3], 100,   np.int16, "M.quad.linear", CAST_LOG)
+                    coefQ_sec = check_int_cast(coef_quad[:, 3:], 10000, np.int32, "M.quad.second", CAST_LOG)
                     m0 = ",".join(str(v) for v in np.concatenate([coefQ_lin[0], coefQ_sec[0]]))
                     m1 = ",".join(str(v) for v in np.concatenate([coefQ_lin[1], coefQ_sec[1]]))
                     m2 = ",".join(str(v) for v in np.concatenate([coefQ_lin[2], coefQ_sec[2]]))
@@ -875,7 +886,7 @@ def run_encode_decode(
                     fb.write(coefQ_sec.astype('<i4').tobytes())   # 3x3 int32 = 12 bytes
 
                 else:
-                    coefQ = check_int_cast(coef, 100, np.int16, "M.linear.tier2")
+                    coefQ = check_int_cast(coef, 100, np.int16, "M.linear.tier2", CAST_LOG)
                     m0 = ",".join(str(v) for v in coefQ[0])
                     m1 = ",".join(str(v) for v in coefQ[1])
                     m2 = ",".join(str(v) for v in coefQ[2])
@@ -906,7 +917,7 @@ def run_encode_decode(
             else:
                 dropped += 1
     with open(bin_path, "r+b") as fb:
-        fb.seek(header_pos + 4)
+        fb.seek(header_pos + 6)
         fb.write(struct.pack('<I', encoded_ok))
     spline_count = encoded_ok - fallback_ok
     total = encoded_ok
@@ -967,9 +978,13 @@ def run_encode_decode(
 
     print(f"[PID {pid}] Huffman: {os.path.getsize(huff_path)} Binary: {os.path.getsize(bin_path)} Text: {os.path.getsize(txt_path)}")
 
-    print(f"Tier 0 (linear):    {tier_counts[0]}/{encoded_ok} = {tier_counts[0]/encoded_ok*100:.1f}%")
-    print(f"Tier 1 (quadratic): {tier_counts[1]}/{encoded_ok} = {tier_counts[1]/encoded_ok*100:.1f}%")
-    print(f"Tier 2 (DCT):       {tier_counts[2]}/{encoded_ok} = {tier_counts[2]/encoded_ok*100:.1f}%")
+    total_px = max(sum(tier_pixel_counts), 1)
+    total_b = max(sum(tier_byte_counts), 1)
+    names = ['linear', 'quadratic', 'DCT']
+    for i, name in enumerate(names):
+        print(f"Tier {i} ({name}): regions {tier_counts[i]}/{encoded_ok} ({tier_counts[i]/encoded_ok*100:.1f}%)"
+            f"  pixels {tier_pixel_counts[i]/total_px*100:.1f}%"
+            f"  bytes {tier_byte_counts[i]/total_b*100:.1f}%")
 
     # Conversion of huffman to binary stream
 
@@ -1019,7 +1034,7 @@ def run_encode_decode(
 
     # 2. Read binary file once to collect all shapes and their data
     with io.BytesIO(bytes(decoded)) as fb:
-        H, W, n_regions = struct.unpack('<HHI', fb.read(8))
+        _, dct_quality_hdr, H, W, n_regions = struct.unpack('<BBHHI', fb.read(10))
 
         for _ in range(n_regions):
             xcQ, ycQ = struct.unpack('<hh', fb.read(4))
@@ -1090,7 +1105,7 @@ def run_encode_decode(
                     x_i = rem % pw
                     qcoeff[y_i, x_i, ch_i] = val
 
-                qt = quality_to_qtable(rd_dct_quality)
+                qt = quality_to_qtable(dct_quality_hdr)
                 residual_hat = np.zeros((ph, pw, 3), dtype=np.float32)
                 for ch in range(3):
                     for y in range(0, ph, block):
@@ -1143,11 +1158,24 @@ def run_encode_decode(
             drawn_clusters += 1
 
     # 5. Coverage + repair
-    imRecoverBin, painted, coverage = repair_coverage(imRecoverBin, painted, max_iters=5, min_coverage=0.98)
-    if coverage < 1.0:
-        imRecoverBin, painted, coverage = repair_coverage_nearest(imRecoverBin, painted)
+    cov_raster = float(np.mean(painted))
+    imRecoverBin, painted, cov_repair = repair_coverage(imRecoverBin, painted, max_iters=5, min_coverage=0.98)
+    cov_nearest = cov_repair
+    if cov_repair < 1.0:
+        imRecoverBin, painted, cov_nearest = repair_coverage_nearest(imRecoverBin, painted)
     imRecoverBin = cv2.cvtColor(imRecoverBin, cv2.COLOR_LAB2RGB)
-    return imRecoverBin, os.path.getsize(huff_path)
+    return imRecoverBin, os.path.getsize(huff_path), CAST_LOG, {
+        'tier_counts': tier_counts,
+        'tier_pixel_counts': tier_pixel_counts,
+        'tier_byte_counts': tier_byte_counts,
+        'spline_count': spline_count,
+        'fallback_ok': fallback_ok,
+        'dropped': dropped,
+        'encoded_ok': encoded_ok,
+        'cov_raster': cov_raster,
+        'cov_repair': cov_repair,
+        'cov_nearest': cov_nearest,
+    }
 
 # %%
 # Hyperparameter tuning on validation set
@@ -1156,13 +1184,15 @@ def run_pipeline(image_path, sigmaColor=35, sigmaSpace=None,
                  low_complexity=2.0, high_complexity=12.0, window_size=7,
                  spline_min_smooth=0.0, spline_max_smooth=20.0, spline_base_perim=200.0,
                  complexity_weights=(0.6, 0.4), corner_thresh_deg=35.0,
-                 rd_lambda=0.001, rd_dct_quality=35):
+                 rd_lambda=0.001, rd_dct_quality=35, lpips_fn=None):
     
     # Run full encode-decode pipeline on one image, return metrics dict.
     if sigmaSpace is None:
         sigmaSpace = sigmaColor
 
     chosenImage = cv2.imread(image_path)
+    if chosenImage is None:
+        raise ValueError(f"could not read image: {image_path}")
     img = cv2.cvtColor(chosenImage, cv2.COLOR_BGR2LAB).astype(float)
     orig_rgb = cv2.cvtColor(chosenImage, cv2.COLOR_BGR2RGB)
 
@@ -1178,7 +1208,7 @@ def run_pipeline(image_path, sigmaColor=35, sigmaSpace=None,
     imgClusters, edgesSorted = run_segmentation(filtered, thresh) 
 
     # Stage 2 & 3: Encode with given parameters
-    rec_rgb, file_size = run_encode_decode(
+    rec_rgb, file_size, CAST_LOG, diag = run_encode_decode(
         img, imgClusters, edgesSorted, chosenImage,
         spline_min_smooth=spline_min_smooth,
         spline_max_smooth=spline_max_smooth,
@@ -1191,6 +1221,13 @@ def run_pipeline(image_path, sigmaColor=35, sigmaSpace=None,
 
     # Metrics
     band_mask, interior_mask = boundary_band_from_labels(imgClusters, radius=2)
+    if lpips_fn is not None:
+        orig_t = torch.from_numpy(orig_rgb.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+        rec_t  = torch.from_numpy(rec_rgb.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+        with torch.no_grad():
+            lpips_val = float(lpips_fn(orig_t, rec_t))
+    else:
+        lpips_val = np.nan
     return {
         'psnr': masked_psnr(orig_rgb, rec_rgb, np.ones(orig_rgb.shape[:2], dtype=bool)),
         'ssim': masked_ssim(orig_rgb, rec_rgb, np.ones(orig_rgb.shape[:2], dtype=bool)),
@@ -1202,7 +1239,233 @@ def run_pipeline(image_path, sigmaColor=35, sigmaSpace=None,
         'bpp': file_size * 8 / (orig_rgb.shape[0] * orig_rgb.shape[1]),
         'thresh': thresh,
         'n_regions': len(edgesSorted),
+        'lpips': lpips_val,
+        'diag': diag,
     }
+
+def load_disjoint_splits(folder, sizes, seed=42):
+    random.seed(seed)
+    _img_exts = {'.jpg', '.jpeg', '.png', '.webp'}
+    filenames = sorted(f for f in os.listdir(folder) if os.path.splitext(f)[1].lower() in _img_exts)
+    if sum(sizes) > len(filenames):
+        raise ValueError(f"Requested {sum(sizes)} images but folder has {len(filenames)}")
+    random.shuffle(filenames)
+    splits, idx = [], 0
+    for size in sizes:
+        splits.append([os.path.join(folder, f) for f in filenames[idx:idx + size]])
+        idx += size
+    return splits
+
+def tune_hyperparameters(tune_images, sc_grid, ss_grid, ht_grid, lt_grid,
+                          smin_grid, smax_grid, bp_grid, cw_grid, bpp_tol=0.05):
+    results_s1 = []
+    for sc in sc_grid:
+        for ss in ss_grid:
+            for ht in ht_grid:
+                for lt in lt_grid:
+                    with ProcessPoolExecutor(max_workers=10) as pool:
+                        scores = list(pool.map(_run_one, [(p, {'sigmaColor': sc, 'sigmaSpace': ss,
+                            'high_thresh': ht, 'low_thresh': lt}) for p in tune_images]))
+                    avg_psnr = np.mean([s['psnr'] for s in scores])
+                    avg_ssim = np.mean([s['ssim'] for s in scores])
+                    avg_bpp  = np.mean([s['bpp']  for s in scores])
+                    results_s1.append({'sigmaColor': sc, 'sigmaSpace': ss, 'high_thresh': ht,
+                        'low_thresh': lt, 'psnr': avg_psnr, 'ssim': avg_ssim, 'bpp': avg_bpp})
+                    print(f"[{time.strftime('%H:%M:%S')}] sc={sc} ss={ss} ht={ht} lt={lt}: "
+                          f"PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
+
+    target_bpp = min(r['bpp'] for r in results_s1)
+    best_s1 = max([r for r in results_s1 if r['bpp'] <= target_bpp * (1 + bpp_tol)],
+                  key=lambda r: r['psnr'])
+    print(f"\nBest S1: {best_s1}")
+
+    results_s2 = []
+    for smin in smin_grid:
+        for smax in smax_grid:
+            for bp in bp_grid:
+                for cw in cw_grid:
+                    cfg = {k: best_s1[k] for k in ['sigmaColor', 'sigmaSpace', 'high_thresh', 'low_thresh']}
+                    cfg.update({'spline_min_smooth': smin, 'spline_max_smooth': smax,
+                                'spline_base_perim': bp, 'complexity_weights': cw})
+                    with ProcessPoolExecutor(max_workers=10) as pool:
+                        scores = list(pool.map(_run_one, [(p, cfg) for p in tune_images]))
+                    avg_psnr = np.mean([s['psnr'] for s in scores])
+                    avg_ssim = np.mean([s['ssim'] for s in scores])
+                    avg_bpp  = np.mean([s['bpp']  for s in scores])
+                    results_s2.append({'smin': smin, 'smax': smax, 'bp': bp, 'cw': cw,
+                        'psnr': avg_psnr, 'ssim': avg_ssim, 'bpp': avg_bpp})
+                    print(f"[{time.strftime('%H:%M:%S')}] smin={smin} smax={smax} bp={bp} cw={cw}: "
+                          f"PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
+
+    target_bpp2 = min(r['bpp'] for r in results_s2)
+    best_s2 = max([r for r in results_s2 if r['bpp'] <= target_bpp2 * (1 + bpp_tol)],
+                  key=lambda r: r['psnr'])
+    print(f"\nBest S2: {best_s2}")
+
+    config = {k: best_s1[k] for k in ['sigmaColor', 'sigmaSpace', 'high_thresh', 'low_thresh']}
+    config.update({'spline_min_smooth': best_s2['smin'], 'spline_max_smooth': best_s2['smax'],
+                   'spline_base_perim': best_s2['bp'], 'complexity_weights': best_s2['cw']})
+    return config, results_s1, results_s2
+
+def validate_stability(stability_images, base_config, bpp_tol=0.05, perturbations=None):
+    if perturbations is None:
+        perturbations = {
+            'sigmaColor':        [-20, +20],
+            'high_thresh':       [-3.0, +3.0],
+            'spline_max_smooth': [-2.0, +2.0],
+        }
+    configs = [('selected', base_config)]
+    for param, deltas in perturbations.items():
+        for d in deltas:
+            neighbor = dict(base_config)
+            neighbor[param] = base_config[param] + d
+            configs.append((f"{param}{'+' if d > 0 else ''}{d}", neighbor))
+
+    results = []
+    for label, cfg in configs:
+        with ProcessPoolExecutor(max_workers=10) as pool:
+            scores = list(pool.map(_run_one, [(p, cfg) for p in stability_images]))
+        avg_psnr = np.mean([s['psnr'] for s in scores])
+        avg_bpp  = np.mean([s['bpp']  for s in scores])
+        results.append({'label': label, 'psnr': avg_psnr, 'bpp': avg_bpp})
+        print(f"  {label:30s}  PSNR={avg_psnr:.2f}  bpp={avg_bpp:.3f}")
+    return results
+
+def run_final_test(test_images, config):
+    with ProcessPoolExecutor(max_workers=10) as pool:
+        scores = list(pool.map(_run_one, [(p, config) for p in test_images]))
+    avg_psnr = np.mean([s['psnr'] for s in scores])
+    avg_ssim = np.mean([s['ssim'] for s in scores])
+    avg_bpp  = np.mean([s['bpp']  for s in scores])
+    print(f"\nFINAL TEST (n={len(test_images)}): PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
+    return {'psnr': avg_psnr, 'ssim': avg_ssim, 'bpp': avg_bpp, 'per_image': scores}
+
+def run_rd_sweep(images, config, lambdas, dct_qualities, lpips_fn=None):
+    results = []
+    for lam in lambdas:
+        for dct_q in dct_qualities:
+            cfg = dict(config)
+            cfg.update({'rd_lambda': lam, 'rd_dct_quality': dct_q, 'lpips_fn': lpips_fn})
+            scores = [run_pipeline(p, **cfg) for p in images]
+            entry = {
+                'lam': lam, 'dct_q': dct_q,
+                'bpp':   np.mean([s['bpp']   for s in scores]),
+                'psnr':  np.mean([s['psnr']  for s in scores]),
+                'ssim':  np.mean([s['ssim']  for s in scores]),
+                'lpips': np.nanmean([s['lpips'] for s in scores]),
+            }
+            results.append(entry)
+            print(f"[{time.strftime('%H:%M:%S')}] lam={lam} dct_q={dct_q}: "
+                  f"PSNR={entry['psnr']:.2f} SSIM={entry['ssim']:.4f} bpp={entry['bpp']:.3f}")
+    return results
+
+def encode_raster_baseline(images, codec, qualities):
+    flag = cv2.IMWRITE_JPEG_QUALITY if codec == 'jpeg' else cv2.IMWRITE_WEBP_QUALITY
+    ext = '.jpg' if codec == 'jpeg' else '.webp'
+    results = []
+    for q in qualities:
+        scores = []
+        for p in images:
+            img_bgr = cv2.imread(p)
+            orig_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            H, W = orig_rgb.shape[:2]
+            _, buf = cv2.imencode(ext, img_bgr, [flag, q])
+            rec_rgb = cv2.cvtColor(cv2.imdecode(buf, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+            full = np.ones((H, W), dtype=bool)
+            scores.append({
+                'psnr': masked_psnr(orig_rgb, rec_rgb, full),
+                'ssim': masked_ssim(orig_rgb, rec_rgb, full),
+                'bpp':  len(buf) * 8 / (H * W),
+            })
+        results.append({
+            'quality': q,
+            'bpp':  np.mean([s['bpp']  for s in scores]),
+            'psnr': np.mean([s['psnr'] for s in scores]),
+            'ssim': np.mean([s['ssim'] for s in scores]),
+        })
+    return results
+
+def plot_rd_curves(ours, baselines, metric='psnr'):
+    ylabel = {'psnr': 'PSNR (dB)', 'ssim': 'SSIM', 'lpips': 'LPIPS'}[metric]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    pts = sorted(ours, key=lambda r: r['bpp'])
+    ax.plot([r['bpp'] for r in pts], [r[metric] for r in pts], marker='o', label='Ours', linewidth=2)
+    styles = {'jpeg': ('darkorange', '--'), 'webp': ('forestgreen', '--'), 'png': ('steelblue', ':')}
+    for label, data in baselines.items():
+        pts_b = sorted(data, key=lambda r: r['bpp'])
+        color, ls = styles.get(label, ('gray', '--'))
+        ax.plot([r['bpp'] for r in pts_b], [r[metric] for r in pts_b],
+                marker='s', label=label.upper(), color=color, linestyle=ls, linewidth=2)
+    ax.set_xlabel('Bits per pixel (bpp)')
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+    return fig, ax
+
+def run_threshold_sweep(images, sc_vals, tau_vals, base_config):
+    grid = {}
+    for sc in sc_vals:
+        for tau in tau_vals:
+            cfg = dict(base_config)
+            cfg.update({'sigmaColor': sc, 'high_thresh': tau})
+            scores = [run_pipeline(p, **cfg) for p in images]
+            grid[(sc, tau)] = {
+                'bpp':       np.mean([s['bpp']       for s in scores]),
+                'psnr':      np.mean([s['psnr']      for s in scores]),
+                'n_regions': np.mean([s['n_regions'] for s in scores]),
+            }
+            print(f"[{time.strftime('%H:%M:%S')}] sc={sc} tau={tau}: "
+                  f"PSNR={grid[(sc,tau)]['psnr']:.2f} bpp={grid[(sc,tau)]['bpp']:.3f} "
+                  f"regions={grid[(sc,tau)]['n_regions']:.0f}")
+    return grid
+
+def plot_threshold_sweep(grid, sc_vals, tau_vals):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    colors = plt.cm.viridis(np.linspace(0, 1, len(sc_vals)))
+    for sc, color in zip(sc_vals, colors):
+        psnrs = [grid[(sc, tau)]['psnr']      for tau in tau_vals]
+        bpps  = [grid[(sc, tau)]['bpp']       for tau in tau_vals]
+        regs  = [grid[(sc, tau)]['n_regions'] for tau in tau_vals]
+        axes[0].plot(tau_vals, psnrs, marker='o', label=f'σ={sc}', color=color, linewidth=2)
+        axes[1].plot(tau_vals, bpps,  marker='o', label=f'σ={sc}', color=color, linewidth=2)
+        axes[2].plot(tau_vals, regs,  marker='o', label=f'σ={sc}', color=color, linewidth=2)
+    for ax, ylabel in zip(axes, ['PSNR (dB)', 'bpp', 'Region count']):
+        ax.set_xlabel('τ (color threshold)')
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.show()
+
+def run_timing_experiment(images, scales, config):
+    tmp = '/tmp/_timing_img.png'
+    results = []
+    for scale in scales:
+        runtimes, n_pix_list = [], []
+        for p in images:
+            img_bgr = cv2.imread(p)
+            H, W = img_bgr.shape[:2]
+            scaled = cv2.resize(img_bgr, (max(1, int(W * scale)), max(1, int(H * scale))))
+            cv2.imwrite(tmp, scaled)
+            t0 = time.perf_counter()
+            run_pipeline(tmp, **config)
+            runtimes.append(time.perf_counter() - t0)
+            n_pix_list.append(scaled.shape[0] * scaled.shape[1])
+        results.append({'scale': scale, 'n_pixels': np.mean(n_pix_list), 'runtime_s': np.mean(runtimes)})
+        print(f"  scale={scale:.2f}x: {np.mean(n_pix_list)/1e6:.2f}Mpx  {np.mean(runtimes):.2f}s")
+    return results
+
+def plot_timing(results):
+    pts = sorted(results, key=lambda r: r['n_pixels'])
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot([r['n_pixels'] / 1e6 for r in pts], [r['runtime_s'] for r in pts], marker='o', linewidth=2)
+    ax.set_xlabel('Megapixels')
+    ax.set_ylabel('Runtime (s)')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
 def _run_one(args):
     path, kwargs = args
@@ -1212,96 +1475,77 @@ def _run_one(args):
 # Hyperparameter Tuning
 
 # %%
-warnings.filterwarnings("ignore")
-
 if __name__ == '__main__':
-    val_images = load_random_n_images('BSDS500/val', n=20, seed=42)
-    results = []
-    for sc in [190]:
-        for ss in [145]:
-            for ht in [28.0]:
-                for lt in [10.5]:
-                    with ProcessPoolExecutor(max_workers=10) as pool:
-                        scores = list(pool.map(_run_one, [(p, {'sigmaColor': sc, 'sigmaSpace': ss, 'high_thresh': ht, 'low_thresh': lt}) for p in val_images]))
-                    avg_psnr = np.mean([s['psnr'] for s in scores])
-                    avg_ssim = np.mean([s['ssim'] for s in scores])
-                    avg_bpp = np.mean([s['bpp'] for s in scores])
-                    results.append({'sigmaColor': sc, 'sigmaSpace': ss, 'high_thresh': ht, 'low_thresh': lt,
-                                   'psnr': avg_psnr, 'ssim': avg_ssim, 'bpp': avg_bpp})
-                    print(f"[{time.strftime('%H:%M:%S')}] sc={sc} ss={ss} ht={ht} lt={lt}: PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
+    warnings.filterwarnings("ignore")
 
-    best = max(results, key=lambda r: r['psnr'])
-    print(f"\nBest S1: sigmaColor={best['sigmaColor']}, sigmaSpace={best['sigmaSpace']}, high_thresh={best['high_thresh']}, low_thresh={best['low_thresh']}")
+    # BSDS500: 15 tune, 30 stability (disjoint, never overlapping)
+    tune_images, stability_images = load_disjoint_splits('BSDS500/val', [15, 30], seed=42)
 
-    results_s2 = []
-    for smin in [1.0]:
-        for smax in [4.5]:
-            for bp in [300.0]:
-                for cw in [(0.40, 0.60)]:
-                    with ProcessPoolExecutor(max_workers=10) as pool:
-                        scores = list(pool.map(_run_one, [(p, {'sigmaColor': best['sigmaColor'],
-                            'sigmaSpace': best['sigmaSpace'],
-                            'high_thresh': best['high_thresh'], 'low_thresh': best['low_thresh'],
-                            'spline_min_smooth': smin, 'spline_max_smooth': smax,
-                            'spline_base_perim': bp, 'complexity_weights': cw}) for p in val_images]))
-                    avg_psnr = np.mean([s['psnr'] for s in scores])
-                    avg_ssim = np.mean([s['ssim'] for s in scores])
-                    avg_bpp = np.mean([s['bpp'] for s in scores])
-                    results_s2.append({'smin': smin, 'smax': smax, 'bp': bp, 'cw': cw,
-                                      'psnr': avg_psnr, 'ssim': avg_ssim, 'bpp': avg_bpp})
-                    print(f"[{time.strftime('%H:%M:%S')}] smin={smin} smax={smax} bp={bp} cw={cw}: PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
+    config_bsds, _, _ = tune_hyperparameters(
+        tune_images,
+        sc_grid=[190], ss_grid=[145], ht_grid=[28.0], lt_grid=[10.5],
+        smin_grid=[1.0], smax_grid=[4.5], bp_grid=[300.0], cw_grid=[(0.40, 0.60)],
+    )
+    print("\nStability check (BSDS):")
+    validate_stability(stability_images, config_bsds)
 
-    best_s2 = max(results_s2, key=lambda r: r['psnr'])
-    print(f"\nBest S2: smin={best_s2['smin']}, smax={best_s2['smax']}, bp={best_s2['bp']}, cw={best_s2['cw']}")
+    val_svgs, test_svgs = load_disjoint_splits('svgs', [15, 23], seed=42)
 
-    val_images = load_random_n_images('svgs', n=20, seed = 42)
+    config_svg, _, _ = tune_hyperparameters(
+        val_svgs,
+        sc_grid=[85], ss_grid=[120], ht_grid=[18.0], lt_grid=[0.0],
+        smin_grid=[0.0], smax_grid=[9.0], bp_grid=[225.0], cw_grid=[(0.40, 0.60)],
+    )
+    print("\nStability check (structured):")
+    validate_stability(test_svgs, config_svg)
 
-    best_svg = []
-    for sc in [85]:
-        for ss in [120]:
-            for ht in [18.0]:
-                for lt in [0.0]:
-                    with ProcessPoolExecutor(max_workers=10) as pool:
-                        scores = list(pool.map(_run_one, [(p, {'sigmaColor': sc, 'sigmaSpace': ss, 'high_thresh': ht, 'low_thresh': lt}) for p in val_images]))
-                    avg_psnr = np.mean([s['psnr'] for s in scores])
-                    avg_ssim = np.mean([s['ssim'] for s in scores])
-                    avg_bpp = np.mean([s['bpp'] for s in scores])
-                    best_svg.append({'sigmaColor': sc, 'sigmaSpace': ss, 'high_thresh': ht, 'low_thresh': lt,
-                                   'psnr': avg_psnr, 'ssim': avg_ssim, 'bpp': avg_bpp})
-                    print(f"[{time.strftime('%H:%M:%S')}] sc={sc} ss={ss} ht={ht} lt={lt}: PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
+    # Final test on held-out sets
+    kodak_images = [os.path.join('kodak', f) for f in sorted(os.listdir('kodak'))]
+    print("\nBSDS final:")
+    run_final_test(kodak_images, config_bsds)
+    print("\nStructured final:")
+    run_final_test(test_svgs, config_svg)
 
-    best_svg = max(best_svg, key=lambda r: r['psnr'])
-    print(f"\nBest SVG: sigmaColor={best_svg['sigmaColor']}, sigmaSpace={best_svg['sigmaSpace']}, high_thresh={best_svg['high_thresh']}, low_thresh={best_svg['low_thresh']}")
+    # R-D sweep — sweep lambda with fixed dct_quality; adjust ranges after lambda calibration
+    lp_fn = lpips.LPIPS(net='alex', verbose=False)
+    lam_grid = [0.5, 1.0, 2.0, 5.0, 10.0]
+    dct_q_grid = [25, 35, 50]
 
-    best_s2_svg = []
-    for smin in [0.0]:
-        for smax in [9.0]:
-            for bp in [225.0]:
-                for cw in [(0.40, 0.60)]:
-                    with ProcessPoolExecutor(max_workers=10) as pool:
-                        scores = list(pool.map(_run_one, [(p, {'sigmaColor': best_svg['sigmaColor'],
-                            'sigmaSpace': best_svg['sigmaSpace'],
-                            'high_thresh': best_svg['high_thresh'], 'low_thresh': best_svg['low_thresh'],
-                            'spline_min_smooth': smin, 'spline_max_smooth': smax,
-                            'spline_base_perim': bp, 'complexity_weights': cw}) for p in val_images]))
-                    avg_psnr = np.mean([s['psnr'] for s in scores])
-                    avg_ssim = np.mean([s['ssim'] for s in scores])
-                    avg_bpp = np.mean([s['bpp'] for s in scores])
-                    best_s2_svg.append({'smin': smin, 'smax': smax, 'bp': bp, 'cw': cw,
-                                      'psnr': avg_psnr, 'ssim': avg_ssim, 'bpp': avg_bpp})
-                    print(f"[{time.strftime('%H:%M:%S')}] smin={smin} smax={smax} bp={bp} cw={cw}: PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
+    print("\nR-D sweep (natural):")
+    rd_natural = run_rd_sweep(kodak_images, config_bsds, lam_grid, dct_q_grid, lpips_fn=lp_fn)
+    print("\nR-D sweep (structured):")
+    rd_structured = run_rd_sweep(test_svgs, config_svg, lam_grid, dct_q_grid, lpips_fn=lp_fn)
 
-    best_s2_svg = max(best_s2_svg, key=lambda r: r['psnr'])
-    print(f"\nBest S2 SVG: smin={best_s2_svg['smin']}, smax={best_s2_svg['smax']}, bp={best_s2_svg['bp']}, cw={best_s2_svg['cw']}")
+    jpeg_q = [10, 20, 30, 50, 70, 85, 95]
+    webp_q = [10, 20, 30, 50, 70, 85, 95]
+    jpeg_natural    = encode_raster_baseline(kodak_images, 'jpeg', jpeg_q)
+    webp_natural    = encode_raster_baseline(kodak_images, 'webp', webp_q)
+    jpeg_structured = encode_raster_baseline(test_svgs,   'jpeg', jpeg_q)
+    webp_structured = encode_raster_baseline(test_svgs,   'webp', webp_q)
 
-    print("\n" + "="*60)
-    print("FINAL RESULTS")
-    print("="*60)
-    print("\nBSDS500:")
-    print(f"  S1: sigmaColor={best['sigmaColor']}, sigmaSpace={best['sigmaSpace']}, high_thresh={best['high_thresh']}, low_thresh={best['low_thresh']} (PSNR={best['psnr']:.2f})")
-    print(f"  S2: smin={best_s2['smin']}, smax={best_s2['smax']}, bp={best_s2['bp']}, cw={best_s2['cw']} (PSNR={best_s2['psnr']:.2f})")
+    print("\nR-D curves (natural):")
+    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='psnr')
+    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='ssim')
+    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='lpips')
 
-    print("\nSVG:")
-    print(f"  S1: sigmaColor={best_svg['sigmaColor']}, sigmaSpace={best_svg['sigmaSpace']}, high_thresh={best_svg['high_thresh']}, low_thresh={best_svg['low_thresh']} (PSNR={best_svg['psnr']:.2f})")
-    print(f"  S2: smin={best_s2_svg['smin']}, smax={best_s2_svg['smax']}, bp={best_s2_svg['bp']}, cw={best_s2_svg['cw']} (PSNR={best_s2_svg['psnr']:.2f})")
-    print("="*60)
+    print("\nR-D curves (structured):")
+    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='psnr')
+    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='ssim')
+    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='lpips')
+
+    # Threshold sweep for Fig 2 — run on stability set (disjoint from test)
+    sc_sweep = [100, 150, 190, 230]
+    tau_sweep = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0]
+    print("\nThreshold sweep (natural):")
+    thresh_grid_natural = run_threshold_sweep(stability_images[:8], sc_sweep, tau_sweep, config_bsds)
+    plot_threshold_sweep(thresh_grid_natural, sc_sweep, tau_sweep)
+
+    # Timing experiment for Fig 4
+    timing_images = kodak_images[:6]
+    scales = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+    print("\nTiming experiment (natural):")
+    timing_natural = run_timing_experiment(timing_images, scales, config_bsds)
+    plot_timing(timing_natural)
+    print("\nTiming experiment (structured):")
+    timing_structured = run_timing_experiment(test_svgs[:6], scales, config_svg)
+    plot_timing(timing_structured)
