@@ -18,6 +18,8 @@ import io
 import random
 from skimage.metrics import structural_similarity as ssim
 import lpips
+from numpy.polynomial import Chebyshev
+from scipy.spatial import cKDTree
 import torch
 import warnings
 from concurrent.futures import ProcessPoolExecutor
@@ -25,6 +27,958 @@ import time
 import json
 
 # %%
+########### v7.2 ablation study #############
+def encode_for_decomposition(img_lab, imgClusters, edgesSorted, clustMeans, path):
+    with open(path, "w") as f:
+        for i in range(len(edgesSorted)):
+            x, y = edgesSorted[i][0], edgesSorted[i][1]
+            contour = enforce_closed_contour_rc(x, y)
+            if len(contour) < 6 or contour_area_rc(contour) < 4.0:
+                continue
+            s_val, _ = adaptive_spline_smooth(contour, min_smooth=0.0, max_smooth=20.0, base_perimeter=200.0)
+            tck = fit_closed_bspline(contour, smooth=s_val, degree=3)
+            wrote_geom = False
+            geom_lines = []
+            if tck is not None:
+                t, c, k = tck
+                cx, cy = c[0], c[1]
+                if len(t) > 0 and len(cx) > 0 and len(cy) > 0:
+                    t_str = ",".join(f"{float(v):.6f}" for v in t)
+                    cx_str = ",".join(f"{float(v):.6f}" for v in cx)
+                    cy_str = ",".join(f"{float(v):.6f}" for v in cy)
+                    geom_lines.append("S;" + str(int(k)) + ";" + t_str + ";" + cx_str + ";" + cy_str + ";")
+                    wrote_geom = True
+            if not wrote_geom:
+                temp = StringIO()
+                if write_loop_L(temp, contour, max_pts=120):
+                    geom_lines.append(temp.getvalue().strip())
+                    wrote_geom = True
+            if wrote_geom:
+                col = clustMeans[i]
+                cluster_id = i + 1
+                region_mask = (imgClusters == cluster_id)
+                coef, xc, yc = fit_region_planar_model(img_lab, region_mask)
+                m0 = ",".join(f"{v:.6f}" for v in coef[0])
+                m1 = ",".join(f"{v:.6f}" for v in coef[1])
+                m2 = ",".join(f"{v:.6f}" for v in coef[2])
+                f.write(f"C;{col[0]},{col[1]},{col[2]};\n")
+                f.write(f"M;{xc:.4f},{yc:.4f};{m0};{m1};{m2};\n")
+                for line in geom_lines:
+                    f.write(line + "\n")
+                f.write("\n")
+
+def run_decomposition(image_path, config):
+    comp_path = f"imComp_{os.getpid()}.txt"
+    chosenImage = cv2.imread(image_path)
+    complexity_score, _ = local_lab_complexity_score(chosenImage, window_size=7)
+    thresh = adaptive_deltaE_threshold(complexity_score, low_complexity=2.0, high_complexity=12.0,
+                                        high_thresh=config['high_thresh'], low_thresh=config['low_thresh'])
+    filtered = cv2.bilateralFilter(chosenImage, d=7, sigmaColor=config['sigmaColor'], sigmaSpace=config['sigmaSpace'])
+    imgClusters, edgesSorted = run_segmentation(filtered, thresh)
+    img_lab = cv2.cvtColor(filtered, cv2.COLOR_BGR2LAB).astype(float)
+
+    clustMeans = []
+    for i in range(len(edgesSorted)):
+        region_mask = (imgClusters == i + 1)
+        clustMeans.append(img_lab[region_mask].mean(axis=0) if region_mask.sum() > 0 else np.zeros(3))
+
+    encode_for_decomposition(img_lab, imgClusters, edgesSorted, clustMeans, comp_path)
+
+    orig_rgb = cv2.cvtColor(chosenImage, cv2.COLOR_BGR2RGB)
+    orig_lab = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2LAB)
+
+    A_rgb = cv2.cvtColor(recon_exact_mean(orig_lab, imgClusters, clustMeans), cv2.COLOR_LAB2RGB)
+    B_rgb = cv2.cvtColor(recon_spline_mean_from_file(comp_path, imgClusters.shape), cv2.COLOR_LAB2RGB)
+    C_rgb = cv2.cvtColor(recon_exact_original(orig_lab, imgClusters), cv2.COLOR_LAB2RGB)
+    D_rgb = cv2.cvtColor(recon_exact_planar(orig_lab, imgClusters), cv2.COLOR_LAB2RGB)
+    E_rgb = cv2.cvtColor(recon_spline_planar_actual(comp_path, imgClusters.shape), cv2.COLOR_LAB2RGB)
+    F_rgb = cv2.cvtColor(recon_spline_original_from_file(comp_path, imgClusters.shape, orig_lab), cv2.COLOR_LAB2RGB)
+
+    band_mask, interior_mask = boundary_band_from_labels(imgClusters, radius=2)
+
+    dC = report("C exact+original", C_rgb, orig_rgb, band_mask, interior_mask)
+    dD = report("D exact+planar", D_rgb, orig_rgb, band_mask, interior_mask)
+    dE = report("E spline+planar", E_rgb, orig_rgb, band_mask, interior_mask)
+    dF = report("F spline+original", F_rgb, orig_rgb, band_mask, interior_mask)
+
+    dseg = dC
+    dbnd = dF - dC
+    dapp = dD - dC
+    dpred = dseg + dbnd + dapp
+    dint = dE - dpred
+    os.remove(comp_path)
+    return {'dseg': dseg, 'dbnd': dbnd, 'dapp': dapp, 'dint': dint, 'dE': dE}
+
+# Spline reconstruction using planar model fill for each cluster
+def recon_spline_planar_actual(imComp_path, img_shape_hw):
+    # 1. Initialize recovery image and list to track cluster sizes for sorting
+    H, W = img_shape_hw
+    imRecover = np.zeros((H, W, 3), dtype=np.uint8)
+    imRecover[:] = (255, 128, 128)
+    clusters_to_draw = []
+
+    # 2. Read the file once to collect all shapes and their data
+    with open(imComp_path, "r") as f:
+        current_cluster = None
+
+        for line in f:
+            l = line.strip().split(';')
+            if len(l) == 0 or l[0] == '':
+                continue
+            
+            # C is start of new cluster
+            if l[0] == 'C':
+                color = np.array([int(i) for i in l[1].split(',')], dtype=np.uint8)
+                current_cluster = {'color': color, 'pts': [], 'model': None}
+                clusters_to_draw.append(current_cluster)
+
+            elif l[0] == 'M' and current_cluster is not None:
+                xc, yc = [float(v) for v in l[1].split(',')]
+                ch0 = np.array([float(v) for v in l[2].split(',')], dtype=float)  # [a,b,c]
+                ch1 = np.array([float(v) for v in l[3].split(',')], dtype=float)
+                ch2 = np.array([float(v) for v in l[4].split(',')], dtype=float)
+                current_cluster['model'] = np.vstack([ch0, ch1, ch2])  # shape (3,3)
+                current_cluster['xc'] = xc
+                current_cluster['yc'] = yc
+
+            elif l[0] == 'S' and current_cluster is not None:
+                # S;degree;knots;ctrl_row;ctrl_col;
+                k = int(l[1])
+                t = np.array([float(v) for v in l[2].split(',')], dtype=float)
+                cx = np.array([float(v) for v in l[3].split(',')], dtype=float)
+                cy = np.array([float(v) for v in l[4].split(',')], dtype=float)
+
+                tck = (t, [cx, cy], k)
+
+                coarse_n = max(128, int(4 * len(cx)))
+                coarse_rows, coarse_cols = splev(np.linspace(0.0, 1.0, coarse_n, endpoint=False), tck)
+
+                drows = np.diff(np.r_[coarse_rows, coarse_rows[0]])
+                dcols = np.diff(np.r_[coarse_cols, coarse_cols[0]])
+                perimeter_estimate = np.sum(np.sqrt(drows**2 + dcols**2))
+
+                n_samples = max(int(np.ceil(perimeter_estimate)), int(4 * len(cx)), 64)
+                rows, cols = splev(np.linspace(0.0, 1.0, n_samples, endpoint=False), tck)
+
+                for r, c in zip(rows, cols):
+                    rr = int(round(r))
+                    cc = int(round(c))
+                    current_cluster['pts'].append([cc, rr])
+            
+            elif l[0] == 'L' and current_cluster is not None:
+                for tok in l[1:]:
+                    if not tok:
+                        continue
+                    rc = tok.split(',')
+                    if len(rc) != 2:
+                        continue
+                    r = int(np.clip(round(float(rc[0])), 0, H-1))
+                    c = int(np.clip(round(float(rc[1])), 0, W-1))
+                    current_cluster['pts'].append([c, r])  # x,y
+
+    # 3. Painter's algorithm sorted by polygon area
+    for cluster in clusters_to_draw:
+        if len(cluster['pts']) > 2:
+            polygon_points = np.array(cluster['pts'], dtype=np.int32).reshape((-1, 1, 2))
+            cluster['area'] = float(abs(cv2.contourArea(polygon_points)))
+        else:
+            cluster['area'] = 0.0
+    
+    clusters_to_draw.sort(key=lambda x: x['area'], reverse=True)
+
+    # 4. Draw + track coverage (single pass)
+    H, W = imRecover.shape[:2]
+    painted = np.zeros((H, W), dtype=np.uint8)
+
+    drawn_clusters = 0
+    for cluster in clusters_to_draw:
+        if len(cluster['pts']) > 2:
+            polygon_points = np.array(cluster['pts'], dtype=np.int32).reshape((-1, 1, 2))
+
+            region = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(region, [polygon_points], color=1)
+            ys, xs = np.where(region == 1)
+
+            if len(xs) == 0:
+                continue
+
+            if cluster.get('model') is None:
+                raise ValueError("Missing M record for cluster")
+
+            coef = cluster['model']  # shape (3,3)
+            dx = xs - cluster['xc']
+            dy = ys - cluster['yc']
+            v0 = coef[0, 0] + coef[0, 1] * dx + coef[0, 2] * dy
+            v1 = coef[1, 0] + coef[1, 1] * dx + coef[1, 2] * dy
+            v2 = coef[2, 0] + coef[2, 1] * dx + coef[2, 2] * dy
+            vals = np.stack([v0, v1, v2], axis=1)
+            imRecover[ys, xs] = np.clip(vals, 0, 255).astype(np.uint8)
+
+            painted[ys, xs] = 1
+            drawn_clusters += 1
+
+    # 5. Coverage + repair
+    imRecover, painted, coverage = repair_coverage(imRecover, painted, max_iters=5, min_coverage=0.98)
+    if coverage < 1.0:
+        imRecover, painted, coverage = repair_coverage_nearest(imRecover, painted)
+
+    return imRecover
+
+#Spline reconstruction using mean color fill for each cluster
+def recon_spline_mean_from_file(imComp_path, shape_hw):
+    # 1. Initialize recovery image and list to track cluster sizes for sorting
+    H, W = shape_hw
+    imRecover = np.zeros((H, W, 3), dtype=np.uint8)
+    imRecover[:] = (255, 128, 128)
+
+    clusters_to_draw = []
+    current_cluster = None
+
+    # 2. Read the file once to collect all shapes and their data
+    with open(imComp_path, "r") as f:
+        for line in f:
+            l = line.strip().split(';')
+            if len(l) == 0 or l[0] == '':
+                continue
+
+            if l[0] == 'C':
+                if len(l) >= 3 and ',' in l[2]:   # C;id;r,g,b;
+                    color = np.array([int(v) for v in l[2].split(',')], dtype=np.uint8)
+                else:                               # C;r,g,b;
+                    color = np.array([int(v) for v in l[1].split(',')], dtype=np.uint8)
+                current_cluster = {'color': color, 'pts': []}
+                clusters_to_draw.append(current_cluster)
+
+            elif l[0] == 'S' and current_cluster is not None:
+                k = int(l[1])
+                t = np.array([float(v) for v in l[2].split(',')], dtype=float)
+                cx = np.array([float(v) for v in l[3].split(',')], dtype=float)
+                cy = np.array([float(v) for v in l[4].split(',')], dtype=float)
+
+                tck = (t, [cx, cy], k)
+
+                coarse_n = max(128, int(4 * len(cx)))
+                coarse_rows, coarse_cols = splev(np.linspace(0.0, 1.0, coarse_n, endpoint=False), tck)
+
+                drows = np.diff(np.r_[coarse_rows, coarse_rows[0]])
+                dcols = np.diff(np.r_[coarse_cols, coarse_cols[0]])
+                perimeter_estimate = np.sum(np.sqrt(drows**2 + dcols**2))
+
+                n_samples = max(int(np.ceil(perimeter_estimate)), int(4 * len(cx)), 64)
+                rows, cols = splev(np.linspace(0.0, 1.0, n_samples, endpoint=False), tck)
+
+                for r, c in zip(rows, cols):
+                    rr, cc = int(round(r)), int(round(c))
+                    if 0 <= rr < H and 0 <= cc < W:
+                        current_cluster['pts'].append([cc, rr])
+
+            elif l[0] == 'L' and current_cluster is not None:
+                for tok in l[1:]:
+                    if not tok:
+                        continue
+                    rc = tok.split(',')
+                    if len(rc) != 2:
+                        continue
+                    r = int(np.clip(round(float(rc[0])), 0, H-1))
+                    c = int(np.clip(round(float(rc[1])), 0, W-1))
+                    current_cluster['pts'].append([c, r])
+
+    # 3. Painter's algorithm sorted by polygon area
+    for cluster in clusters_to_draw:
+        if len(cluster['pts']) > 2:
+            polygon_points = np.array(cluster['pts'], dtype=np.int32).reshape((-1, 1, 2))
+            cluster['area'] = float(abs(cv2.contourArea(polygon_points)))
+        else:
+            cluster['area'] = 0.0
+
+    clusters_to_draw.sort(key=lambda x: x['area'], reverse=True)
+
+    # 4. Draw + track coverage (single pass)
+    H, W = imRecover.shape[:2]
+    painted = np.zeros((H, W), dtype=np.uint8)
+
+    for cluster in clusters_to_draw:
+        if len(cluster['pts']) > 2:
+            polygon_points = np.array(cluster['pts'], dtype=np.int32).reshape((-1, 1, 2))
+            region = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(region, [polygon_points], color=1)
+            ys, xs = np.where(region == 1)
+
+            if len(xs) == 0:
+                continue
+
+            imRecover[ys, xs] = cluster['color']
+            painted[ys, xs] = 1
+
+    # 5. Coverage + repair
+    imRecover, painted, coverage = repair_coverage(imRecover, painted, max_iters=5, min_coverage=0.98)
+    if coverage < 1.0:
+        imRecover, painted, coverage = repair_coverage_nearest(imRecover, painted)
+
+    return imRecover
+
+# Spline reconstruction using original colors for each cluster
+def recon_spline_original_from_file(imComp_path, img_shape_hw, orig_lab):
+    # 1. Initialize recovery image and list to track cluster sizes for sorting
+    H, W = img_shape_hw
+    imRecover = np.zeros((H, W, 3), dtype=np.uint8)
+    imRecover[:] = (255, 128, 128) 
+    clusters_to_draw = []
+    current_cluster = None
+    next_id = 1
+
+    # 2. Read the file once to collect all shapes and their data
+    with open(imComp_path, "r") as f:
+        for line in f:
+            l = line.strip().split(';')
+            if len(l) == 0 or l[0] == '':
+                continue
+
+            if l[0] == 'C':
+                # supports C;id;r,g,b; and C;r,g,b;
+                if len(l) >= 3 and ',' in l[2]:
+                    color = np.array([int(v) for v in l[2].split(',')], dtype=np.uint8)
+                else:
+                    color = np.array([int(v) for v in l[1].split(',')], dtype=np.uint8)
+                    next_id += 1
+
+                current_cluster = {'color': color, 'pts': []}
+                clusters_to_draw.append(current_cluster)
+
+            elif l[0] == 'S' and current_cluster is not None:
+                k = int(l[1])
+                t = np.array([float(v) for v in l[2].split(',')], dtype=float)
+                cx = np.array([float(v) for v in l[3].split(',')], dtype=float)
+                cy = np.array([float(v) for v in l[4].split(',')], dtype=float)
+                tck = (t, [cx, cy], k)
+
+                coarse_n = max(128, int(4 * len(cx)))
+                coarse_rows, coarse_cols = splev(np.linspace(0.0, 1.0, coarse_n, endpoint=False), tck)
+                
+                drows = np.diff(np.r_[coarse_rows, coarse_rows[0]])
+                dcols = np.diff(np.r_[coarse_cols, coarse_cols[0]])
+                perimeter_estimate = np.sum(np.sqrt(drows**2 + dcols**2))
+                
+                n_samples = max(int(np.ceil(perimeter_estimate)), int(4 * len(cx)), 64)
+                rows, cols = splev(np.linspace(0.0, 1.0, n_samples, endpoint=False), tck)
+
+                for r, c in zip(rows, cols):
+                    rr, cc = int(round(r)), int(round(c))
+                    if 0 <= rr < H and 0 <= cc < W:
+                        current_cluster['pts'].append([cc, rr])  # x,y
+
+            elif l[0] == 'L' and current_cluster is not None:
+                for tok in l[1:]:
+                    if not tok:
+                        continue
+                    rc = tok.split(',')
+                    if len(rc) != 2:
+                        continue
+                    r = int(np.clip(round(float(rc[0])), 0, H - 1))
+                    c = int(np.clip(round(float(rc[1])), 0, W - 1))
+                    current_cluster['pts'].append([c, r])  # x,y
+
+    for cluster in clusters_to_draw:
+        if len(cluster['pts']) > 2:
+            polygon_points = np.array(cluster['pts'], dtype=np.int32).reshape((-1, 1, 2))
+            cluster['area'] = float(abs(cv2.contourArea(polygon_points)))
+        else:
+            cluster['area'] = 0.0
+    clusters_to_draw.sort(key=lambda x: x['area'], reverse=True)
+
+    # 4. Draw + track coverage (single pass)
+    painted = np.zeros((H, W), dtype=np.uint8)
+    H, W = imRecover.shape[:2]
+
+    for cluster in clusters_to_draw:
+        if len(cluster['pts']) > 2:
+            polygon_points = np.array(cluster['pts'], dtype=np.int32).reshape((-1, 1, 2))
+            
+            region = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(region, [polygon_points], color=1)
+            ys, xs = np.where(region == 1)
+            
+            if len(xs) == 0:
+                continue
+
+            # ORIGINAL per-pixel interior
+            imRecover[ys, xs] = orig_lab[ys, xs]
+            painted[ys, xs] = 1
+
+    # 5. Coverage + repair
+    imRecover, painted, coverage = repair_coverage(imRecover, painted, max_iters=5, min_coverage=0.98)
+    if coverage < 1.0:
+        imRecover, painted, coverage = repair_coverage_nearest(imRecover, painted)
+
+    return imRecover
+
+# Exact reconstruction using original colors for each cluster
+def recon_exact_original(img_lab, imgClusters):
+    imRecover = np.zeros_like(img_lab, dtype=np.uint8)
+    cluster_ids = sorted([int(i) for i in np.unique(imgClusters) if int(i) > 0])
+
+    for cluster_id in cluster_ids:
+        region_mask = (imgClusters == cluster_id)
+        imRecover[region_mask] = img_lab[region_mask]
+
+    return imRecover
+
+# Exact reconstruction using mean color for each cluster
+def recon_exact_mean(img_lab, imgClusters, clustMeans):
+    imRecover = np.zeros_like(img_lab, dtype=np.uint8)
+    cluster_ids = sorted([int(i) for i in np.unique(imgClusters) if int(i) > 0])
+
+    for cluster_id in cluster_ids:
+        region_mask = (imgClusters == cluster_id)
+        imRecover[region_mask] = np.array(clustMeans[cluster_id - 1], dtype=np.uint8)
+
+    return imRecover
+
+# Exact reconstruction using planar model fit for each cluster
+def recon_exact_planar(img_lab, imgClusters):
+    imRecover = np.zeros_like(img_lab, dtype=np.uint8)
+    cluster_ids = sorted([int(i) for i in np.unique(imgClusters) if int(i) > 0])
+
+    for cluster_id in cluster_ids:
+        region_mask = (imgClusters == cluster_id)
+        ys, xs = np.where(region_mask)
+        if len(xs) == 0:
+            continue
+
+        coef, xc, yc = fit_region_planar_model(img_lab, region_mask)  # (3,3), [a,b,c] per channel
+        dx = xs - xc
+        dy = ys - yc
+        v0 = coef[0, 0] + coef[0, 1] * dx + coef[0, 2] * dy
+        v1 = coef[1, 0] + coef[1, 1] * dx + coef[1, 2] * dy
+        v2 = coef[2, 0] + coef[2, 1] * dx + coef[2, 2] * dy
+        vals = np.stack([v0, v1, v2], axis=1)
+        imRecover[ys, xs] = np.clip(vals, 0, 255).astype(np.uint8)
+
+    return imRecover
+
+# Return metrics for each reconstruction, overall and split by boundary/interior regions
+def report(name, rec_rgb, orig_rgb, band_mask, interior_mask):
+    full_mse   = compute_mse(orig_rgb, rec_rgb)
+    full_mae = masked_mae(orig_rgb, rec_rgb, np.ones(orig_rgb.shape[:2], dtype=bool))
+    full_psnr = masked_psnr(orig_rgb, rec_rgb, np.ones(orig_rgb.shape[:2], dtype=bool))
+    full_ssim = ssim(orig_rgb, rec_rgb, channel_axis=2, data_range=255)
+    full_lpips = compute_lpips(orig_rgb, rec_rgb)
+
+    b_mae = masked_mae(orig_rgb, rec_rgb, band_mask)
+    i_mae = masked_mae(orig_rgb, rec_rgb, interior_mask)
+
+    b_psnr = masked_psnr(orig_rgb, rec_rgb, band_mask)
+    i_psnr = masked_psnr(orig_rgb, rec_rgb, interior_mask)
+
+    b_ssim = masked_ssim(orig_rgb, rec_rgb, band_mask)
+    i_ssim = masked_ssim(orig_rgb, rec_rgb, interior_mask)
+
+    print(f"{name}:")
+    print(f"  full      MSE={full_mse:.4f}, MAE={full_mae:.3f}, PSNR={full_psnr:.3f}, SSIM={full_ssim:.4f}, LPIPS={full_lpips:.4f}")
+    print(f"  boundary  MAE={b_mae:.3f}, PSNR={b_psnr:.3f}, SSIM={b_ssim:.4f}")
+    print(f"  interior  MAE={i_mae:.3f}, PSNR={i_psnr:.3f}, SSIM={i_ssim:.4f}")
+
+    return full_mse
+
+def aggregate_decomposition(images, config, label):
+    with ProcessPoolExecutor(max_workers=10) as pool:
+        results = list(pool.map(_run_decomposition_one, [(p, config) for p in images]))
+    avg = {k: float(np.mean([r[k] for r in results])) for k in results[0]}
+    print(f"\n{label} (n={len(images)}): {avg}")
+    return avg
+
+########### v7.2 ablation study #############
+
+########### v7.3 boundary encoding study #############
+def run_boundary_comparison(image_path, config):
+    comp_path = f"imComp_{os.getpid()}.txt"
+    chosenImage = cv2.imread(image_path)
+    complexity_score, _ = local_lab_complexity_score(chosenImage, window_size=7)
+    thresh = adaptive_deltaE_threshold(complexity_score, low_complexity=2.0, high_complexity=12.0,
+                                        high_thresh=config['high_thresh'], low_thresh=config['low_thresh'])
+    filtered = cv2.bilateralFilter(chosenImage, d=7, sigmaColor=config['sigmaColor'], sigmaSpace=config['sigmaSpace'])
+    imgClusters, edgesSorted = run_segmentation(filtered, thresh)
+    img = cv2.cvtColor(filtered, cv2.COLOR_BGR2LAB).astype(float)
+    H, W = img.shape[:2]
+    min_area = 50.0
+
+    orig_rgb = cv2.cvtColor(chosenImage, cv2.COLOR_BGR2RGB)
+    band_mask, interior_mask = boundary_band_from_labels(imgClusters, radius=2)
+
+    budgets = [8, 12, 16, 20, 24]
+    byte_budgets = [120, 160, 200, 250, 300, 400]
+    methods = {'B-spline': bspline_at_n, 'Bezier': bezier_at_n, 'Chebyshev': chebyshev_at_n, 'Polynomial': poly_at_n}
+
+    result = {'param_matched': {m: {n: {} for n in budgets} for m in methods},
+              'byte_matched': {m: {B: {} for B in byte_budgets} for m in methods}}
+
+    iou_scores = {m: {n: [] for n in budgets} for m in methods}
+    chamfer_scores = {m: {n: [] for n in budgets} for m in methods}
+    for x_list, y_list in edgesSorted:
+        contour = enforce_closed_contour_rc(x_list, y_list)
+        if len(contour) < 8 or contour_area_rc(contour) < min_area or (len(contour) - 1) < max(budgets):
+            continue
+        cache, ok = {}, True
+        for n in budgets:
+            for name, fn in methods.items():
+                pts = fn(contour, n, H, W)
+                if pts is None or len(pts) < 3:
+                    ok = False
+                cache[(n, name)] = pts
+        if ok:
+            for n in budgets:
+                for name in methods:
+                    iou_scores[name][n].append(contour_iou(H, W, cache[(n, name)], contour))
+                    chamfer_scores[name][n].append(symmetric_chamfer(cache[(n, name)], contour))
+
+    for m in methods:
+        for n in budgets:
+            result['param_matched'][m][n]['iou'] = float(np.mean(iou_scores[m][n])) if iou_scores[m][n] else np.nan
+            result['param_matched'][m][n]['chamfer'] = float(np.mean(chamfer_scores[m][n])) if chamfer_scores[m][n] else np.nan
+
+    for m, fn in methods.items():
+        for n in budgets:
+            rec_rgb = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
+            result['param_matched'][m][n]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
+            result['param_matched'][m][n]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
+            result['param_matched'][m][n]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
+
+    n_at = {B: {m: max_n_for_bytes(m, B) for m in methods} for B in byte_budgets}
+    for B in byte_budgets:
+        for m, fn in methods.items():
+            n = n_at[B][m]
+            rec_rgb = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
+            result['byte_matched'][m][B]['n'] = n
+            result['byte_matched'][m][B]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
+            result['byte_matched'][m][B]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
+            result['byte_matched'][m][B]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
+    os.remove(comp_path)
+    return result
+
+def compress_fixed_n(fit_fn, n, img, imgClusters, edgesSorted, min_area, path):
+    with open(path, 'w') as f:
+        for i, (x_list, y_list) in enumerate(edgesSorted):
+            contour = enforce_closed_contour_rc(x_list, y_list)
+            if len(contour) < 3:
+                continue
+            cluster_id = i + 1
+            region_mask = (imgClusters == cluster_id)
+            coef, xc, yc = fit_region_planar_model(img, region_mask)
+            m0 = ','.join(f'{v:.6f}' for v in coef[0])
+            m1 = ','.join(f'{v:.6f}' for v in coef[1])
+            m2 = ','.join(f'{v:.6f}' for v in coef[2])
+            f.write(f'M;{xc:.4f},{yc:.4f};{m0};{m1};{m2};\n')
+            pts = None
+            if len(contour) >= 8 and contour_area_rc(contour) >= min_area and (len(contour) - 1) >= n:
+                pts = fit_fn(contour, n, img.shape[0], img.shape[1])
+            if pts is None or len(pts) < 3:
+                pts = subsample_to_n(contour, n)
+            payload = ';'.join(f'{float(r):.4f},{float(c):.4f}' for r, c in pts)
+            f.write(f'L;{payload};\n\n')
+    rec_lab = decode_planar_any_geometry(path, img.shape[:2])
+    return cv2.cvtColor(rec_lab, cv2.COLOR_LAB2RGB)
+
+def geom_bytes(method, n, k=3):
+    if method == 'B-spline':
+        n_knots = n + k + 1
+        return 4 + n_knots * 2 + 2 + n * 4 * 2
+    elif method == 'Bezier':
+        return 3 + n * 4 * 2
+    elif method in ('Chebyshev', 'Polynomial'):
+        n_segs = max(1, n // (k + 1))
+        return 4 + n_segs * 2 * (k + 1) * 4
+
+def max_n_for_bytes(method, budget):
+    for n in range(60, 3, -1):
+        if geom_bytes(method, n) <= budget:
+            return n
+    return None
+
+def decode_planar_any_geometry(imComp_path, shape_hw):
+    # 1. Initialize recovery image and list to track cluster sizes for sorting
+    H, W = shape_hw
+    imRecover = np.zeros((H, W, 3), dtype=np.uint8)
+    imRecover[:] = (255, 128, 128) 
+    clusters_to_draw = []
+
+    # 2. Read the file once to collect all shapes and their data
+    with open(imComp_path, 'r') as f:
+        current_cluster = None
+
+        for line in f:
+            l = line.strip().split(';')
+            if len(l) == 0 or l[0] == '':
+                continue
+
+            tag = l[0]
+            if tag == 'M':
+                xc, yc = [float(v) for v in l[1].split(',')]
+                ch0 = np.array([float(v) for v in l[2].split(',')], dtype=float)
+                ch1 = np.array([float(v) for v in l[3].split(',')], dtype=float)
+                ch2 = np.array([float(v) for v in l[4].split(',')], dtype=float)
+                
+                current_cluster = {'model': np.vstack([ch0, ch1, ch2]), 'xc': xc, 'yc': yc, 'pts': []}
+                clusters_to_draw.append(current_cluster)
+
+            elif tag == 'S' and current_cluster is not None:
+                k = int(l[1])
+                t = np.array([float(v) for v in l[2].split(',')], dtype=float)
+                cx = np.array([float(v) for v in l[3].split(',')], dtype=float)
+                cy = np.array([float(v) for v in l[4].split(',')], dtype=float)
+                
+                tck = (t, [cx, cy], k)
+
+                coarse_n = max(128, int(4 * len(cx)))
+                coarse_rows, coarse_cols = splev(np.linspace(0.0, 1.0, coarse_n, endpoint=False), tck)
+
+                drows = np.diff(np.r_[coarse_rows, coarse_rows[0]])
+                dcols = np.diff(np.r_[coarse_cols, coarse_cols[0]])
+                perimeter_estimate = np.sum(np.sqrt(drows**2 + dcols**2))
+
+                n_samples = max(int(np.ceil(perimeter_estimate)), int(4 * len(cx)), 64)
+                rows, cols = splev(np.linspace(0.0, 1.0, n_samples, endpoint=False), tck)
+                
+                for r, c in zip(rows, cols):
+                    rr = int(round(r))
+                    cc = int(round(c))
+                    current_cluster['pts'].append([cc, rr])
+
+            elif tag == 'B' and current_cluster is not None:
+                p0 = np.array([float(v) for v in l[1].split(',')], dtype=float)
+                p1 = np.array([float(v) for v in l[2].split(',')], dtype=float)
+                p2 = np.array([float(v) for v in l[3].split(',')], dtype=float)
+                p3 = np.array([float(v) for v in l[4].split(',')], dtype=float)
+                chord = np.linalg.norm(p3 - p0)
+                n_samples = max(12, int(chord * 2.0))
+                seg_pts = sample_bezier_rc(p0, p1, p2, p3, H, W, n_samples)
+                for r, c in seg_pts:
+                    current_cluster['pts'].append([c, r])  # x,y
+
+
+            elif tag == 'P' and current_cluster is not None:
+                startPt = int(l[1])
+                poly_coeffs = [float(i) for i in l[2].split(',')]
+                p = np.poly1d(poly_coeffs)
+                endPt = int(l[3])
+                step = 1 if endPt >= startPt else -1
+                for r in range(startPt, endPt + step, step):
+                    rr = int(np.clip(r, 0, H - 1))
+                    cc = int(np.clip(round(p(r)), 0, W - 1))
+                    current_cluster['pts'].append([cc, rr])
+
+            elif tag == 'V' and current_cluster is not None:
+                r_start, c_start = [int(k) for k in l[1].split(',')]
+                r_end, c_end = [int(k) for k in l[2].split(',')]
+                steps = max(abs(r_end - r_start), abs(c_end - c_start))
+                if steps > 0:
+                    for s in range(steps + 1):
+                        rr = int(r_start + s * (r_end - r_start) / steps)
+                        cc = int(c_start + s * (c_end - c_start) / steps)
+                        rr = int(np.clip(rr, 0, H - 1))
+                        cc = int(np.clip(cc, 0, W - 1))
+                        current_cluster['pts'].append([cc, rr])
+
+            elif tag == 'L' and current_cluster is not None:
+                for tok in l[1:]:
+                    if not tok:
+                        continue
+                    rc = tok.split(',')
+                    if len(rc) != 2:
+                        continue
+                    r = int(np.clip(round(float(rc[0])), 0, H - 1))
+                    c = int(np.clip(round(float(rc[1])), 0, W - 1))
+                    current_cluster['pts'].append([c, r])
+
+    # 3. Painter's algorithm sorted by polygon area
+    for cluster in clusters_to_draw:
+        if len(cluster['pts']) > 2:
+            polygon_points = np.array(cluster['pts'], dtype=np.int32).reshape((-1, 1, 2))
+            cluster['area'] = float(abs(cv2.contourArea(polygon_points)))
+        else:
+            cluster['area'] = 0.0
+        
+    clusters_to_draw.sort(key=lambda c: c['area'], reverse=True)
+
+    # 4. Draw + track coverage (single pass)
+    H, W = imRecover.shape[:2]
+    painted = np.zeros((H, W), dtype=np.uint8)
+
+    for cluster in clusters_to_draw:
+        if len(cluster['pts']) <= 2:
+            continue
+        polygon_points = np.array(cluster['pts'], dtype=np.int32).reshape((-1, 1, 2))
+        
+        region = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillPoly(region, [polygon_points], color=1)
+        ys, xs = np.where(region == 1)
+        
+        if len(xs) == 0:
+            continue
+
+        coef = cluster['model']
+        dx = xs - cluster['xc']
+        dy = ys - cluster['yc']
+        v0 = coef[0, 0] + coef[0, 1] * dx + coef[0, 2] * dy
+        v1 = coef[1, 0] + coef[1, 1] * dx + coef[1, 2] * dy
+        v2 = coef[2, 0] + coef[2, 1] * dx + coef[2, 2] * dy
+        vals = np.stack([v0, v1, v2], axis=1)
+        imRecover[ys, xs] = np.clip(vals, 0, 255).astype(np.uint8)
+
+        painted[ys, xs] = 1
+
+    #  5. Coverage + repair
+    imRecover, painted, coverage = repair_coverage(imRecover, painted, max_iters=5, min_coverage=0.98)
+    if coverage < 1.0:
+        imRecover, painted, coverage = repair_coverage_nearest(imRecover, painted)
+
+    return imRecover
+
+def fit_param_segment(seg_pts, H, W, deg=3, n_out=24):
+    rows = np.array([p[0] for p in seg_pts], dtype=float)
+    cols = np.array([p[1] for p in seg_pts], dtype=float)
+    t = np.linspace(0.0, 1.0, len(seg_pts))
+    tt = np.linspace(0.0, 1.0, max(8, int(n_out)))
+    fr = Chebyshev.fit(t, rows, deg)
+    fc = Chebyshev.fit(t, cols, deg)
+    rr = fr(tt)
+    cc = fc(tt)
+    out = []
+    for r, c in zip(rr, cc):
+        rr_i = int(np.clip(round(r), 0, H-1))
+        cc_i = int(np.clip(round(c), 0, W-1))
+        if not out or out[-1] != (rr_i, cc_i):
+            out.append((rr_i, cc_i))
+    return out
+
+# Piecewise cubic Bezier helpers
+def contour_polygon_area(contour_pts):
+    if len(contour_pts) < 4:
+        return 0.0
+    pts = contour_pts[:-1] if contour_pts[0] == contour_pts[-1] else contour_pts
+    if len(pts) < 3:
+        return 0.0
+    x = np.array([p[1] for p in pts], dtype=float)
+    y = np.array([p[0] for p in pts], dtype=float)
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+def simplify_contour_dp(contour_pts, eps_ratio=0.01):
+    # Simplify contour with Douglas-Peucker in (x,y) = (col,row)
+    if len(contour_pts) < 6:
+        return contour_pts
+
+    base = contour_pts[:-1] if contour_pts[0] == contour_pts[-1] else contour_pts
+    if len(base) < 4:
+        return contour_pts
+
+    arr = np.array([[p[1], p[0]] for p in base], dtype=np.float32).reshape((-1, 1, 2))
+    peri = cv2.arcLength(arr, True)
+    eps = max(0.5, eps_ratio * peri)
+    approx = cv2.approxPolyDP(arr, eps, True).reshape((-1, 2))
+
+    simp = [(int(round(y)), int(round(x))) for x, y in approx]
+    if len(simp) < 4:
+        return contour_pts
+
+    if simp[0] != simp[-1]:
+        simp.append(simp[0])
+    return simp
+
+def choose_adaptive_stride(contour_pts):
+    # Larger stride for longer/smoother contours to reduce micro-segments
+    n = len(contour_pts)
+    area = contour_polygon_area(contour_pts)
+    if n < 20 or area < 20:
+        return 2
+    if n < 40 or area < 60:
+        return 3
+    if n < 80 or area < 150:
+        return 4
+    return 6
+
+def build_bezier_segments(contour_rc, stride=4, alpha=0.10, min_chord=2.0):
+    base = contour_rc[:-1] if contour_rc[0] == contour_rc[-1] else contour_rc
+    n = len(base)
+    if n < 4:
+        return []
+
+    stride = max(1, int(stride))
+    anchors = [base[i] for i in range(0, n, stride)]
+    if len(anchors) < 4:
+        anchors = base[:]
+
+    k = len(anchors)
+    segs = []
+    for i in range(k):
+        p0 = np.array(anchors[(i - 1) % k], dtype=float)
+        p1 = np.array(anchors[i], dtype=float)
+        p2 = np.array(anchors[(i + 1) % k], dtype=float)
+        p3 = np.array(anchors[(i + 2) % k], dtype=float)
+
+        b0 = p1
+        b1 = p1 + alpha * (p2 - p0)
+        b2 = p2 - alpha * (p3 - p1)
+        b3 = p2
+
+        if np.linalg.norm(b3 - b0) >= min_chord:
+            segs.append((b0, b1, b2, b3))
+    return segs
+
+def sample_bezier_rc(p0, p1, p2, p3, H, W, n_samples):
+    pts = []
+    for t in np.linspace(0.0, 1.0, max(8, int(n_samples))):
+        a = (1 - t) ** 3
+        b = 3 * (1 - t) ** 2 * t
+        c = 3 * (1 - t) * t ** 2
+        d = t ** 3
+        p = a * p0 + b * p1 + c * p2 + d * p3  # p = [row, col]
+        r = int(np.clip(round(p[0]), 0, H - 1))
+        c_ = int(np.clip(round(p[1]), 0, W - 1))
+        if not pts or pts[-1] != (r, c_):
+            pts.append((r, c_))
+    return pts
+
+# Sub sampling methods for comparison
+def subsample_to_n(contour, n):
+    if len(contour) == 0: return contour
+    base = contour[:-1] if contour[0] == contour[-1] else contour
+    if len(base) <= n:
+        return contour
+    idx = np.round(np.linspace(0, len(base) - 1, n)).astype(int)
+    sampled = [base[i] for i in idx]
+    sampled.append(sampled[0])
+    return sampled
+
+def bspline_at_n(contour, n_target, H, W, max_iter=40):
+    base = contour[:-1] if contour[0] == contour[-1] else contour
+    if len(base) < n_target:
+        return None
+    rows = np.array([p[0] for p in base], dtype=float)
+    cols = np.array([p[1] for p in base], dtype=float)
+    s_lo, s_hi = 0.0, float(len(base)) * 100.0
+    best_tck = None
+    best_gap = 1e9
+    for _ in range(max_iter):
+        s_mid = 0.5 * (s_lo + s_hi)
+        try:
+            tck, _ = splprep([rows, cols], s=s_mid, per=True, k=3)
+        except Exception:
+            s_hi = s_mid
+            continue
+        n_ctrl = len(tck[1][0])
+        gap = abs(n_ctrl - n_target)
+        if gap < best_gap:
+            best_tck, best_gap = tck, gap
+        if n_ctrl > n_target:
+            s_lo = s_mid
+        elif n_ctrl < n_target:
+            s_hi = s_mid
+        else:
+            break
+    if best_tck is None or best_gap > 2:
+        return None
+    n_ctrl = len(best_tck[1][0])
+    r, c = splev(np.linspace(0, 1, max(200, 4 * n_ctrl), endpoint=False), best_tck)
+    return list(zip(r, c))
+
+def bezier_at_n(contour, n, H, W):
+    sub = subsample_to_n(contour, n)
+    if len(sub) < 5: return None
+    segs = build_bezier_segments(sub, stride=1, min_chord=0.0)
+    if not segs: return None
+    pts = []
+    for b0, b1, b2, b3 in segs:
+        pts.extend(sample_bezier_rc(b0, b1, b2, b3, H, W, max(8, int(np.linalg.norm(b3-b0)*2))))
+    return pts if len(pts) > 2 else None
+
+def chebyshev_at_n(contour, n, H, W, deg=3):
+    base = contour[:-1] if contour[0] == contour[-1] else contour
+    if len(base) < 4: return None
+    n_segs  = max(1, n // (deg + 1))
+    seg_len = max(4, len(base) // n_segs)
+    fitted  = []
+    for s in range(0, len(base), seg_len):
+        seg = base[s : s + seg_len + 1]
+        if len(seg) < 4: continue
+        fitted.extend(fit_param_segment(seg, H, W, deg=deg, n_out=max(12, len(seg)*2)))
+    return fitted if len(fitted) >= 3 else None
+
+def poly_at_n(contour, n, H, W, deg=3):
+    base = contour[:-1] if contour[0] == contour[-1] else contour
+    if len(base) < 4: return None
+    n_segs  = max(1, n // (deg + 1))
+    seg_len = max(4, len(base) // n_segs)
+    fitted  = []
+    for s in range(0, len(base), seg_len):
+        seg = base[s : s + seg_len + 1]
+        if len(seg) < 4: continue
+        rows = np.array([p[0] for p in seg], dtype=float)
+        cols = np.array([p[1] for p in seg], dtype=float)
+        t  = np.linspace(0.0, 1.0, len(seg))
+        tt = np.linspace(0.0, 1.0, max(12, len(seg) * 2))
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', np.exceptions.RankWarning)
+            pr = np.poly1d(np.polyfit(t, rows, deg))
+            pc = np.poly1d(np.polyfit(t, cols, deg))
+        for r, c in zip(pr(tt), pc(tt)):
+            ri = int(np.clip(round(r), 0, H - 1))
+            ci = int(np.clip(round(c), 0, W - 1))
+            if not fitted or fitted[-1] != (ri, ci):
+                fitted.append((ri, ci))
+    return fitted if len(fitted) >= 3 else None
+
+# Rasterize both contours as filled polygons and compute pixel-level IoU
+def rasterize(pts_rc, H, W):
+    mask = np.zeros((H, W), dtype=np.uint8)
+    arr = np.array([[c, r] for r, c in pts_rc], dtype=np.int32).reshape(-1, 1, 2)
+    cv2.fillPoly(mask, [arr], 1)
+    return mask
+
+def contour_iou(H, W, pts_fit_rc, pts_orig_rc):
+    m_fit  = rasterize(pts_fit_rc, H, W)
+    m_orig = rasterize(pts_orig_rc, H, W)
+    inter = int(np.sum((m_fit == 1) & (m_orig == 1)))
+    union = int(np.sum((m_fit == 1) | (m_orig == 1)))
+    return inter / union if union > 0 else 1.0
+
+def symmetric_chamfer(pts_a, pts_b):
+    a = np.array(pts_a, dtype=np.float64)
+    b = np.array(pts_b, dtype=np.float64)
+    
+    # Distance from A to B
+    tree_b = cKDTree(b)
+    d_a2b, _ = tree_b.query(a)
+    term_a = np.mean(d_a2b ** 2)  # Mean of squared distances
+    
+    # Distance from B to A
+    tree_a = cKDTree(a)
+    d_b2a, _ = tree_a.query(b)
+    term_b = np.mean(d_b2a ** 2)  # Mean of squared distances
+    
+    return term_a + term_b
+
+def aggregate_boundary_comparison(images, config, label):
+    with ProcessPoolExecutor(max_workers=10) as pool:
+        results = list(pool.map(_run_boundary_one, [(p, config) for p in images]))
+    methods = list(results[0]['param_matched'].keys())
+    budgets = list(results[0]['param_matched'][methods[0]].keys())
+    byte_budgets = list(results[0]['byte_matched'][methods[0]].keys())
+
+    avg = {'param_matched': {m: {n: {} for n in budgets} for m in methods},
+           'byte_matched': {m: {B: {} for B in byte_budgets} for m in methods}}
+    for m in methods:
+        for n in budgets:
+            for metric in results[0]['param_matched'][m][n]:
+                avg['param_matched'][m][n][metric] = float(np.nanmean([r['param_matched'][m][n][metric] for r in results]))
+        for B in byte_budgets:
+            for metric in results[0]['byte_matched'][m][B]:
+                avg['byte_matched'][m][B][metric] = float(np.nanmean([r['byte_matched'][m][B][metric] for r in results]))
+
+    print(f"\n{label} boundary comparison (n={len(images)}):")
+    return avg
+
+########### v7.3 boundary encoding study #############
+
+########### v7.4 end-to-end functions #############
 CAST_LOG = {}
 def load_random_n_images(folder, n=20, seed=42):
     random.seed(seed)
@@ -1231,7 +2185,6 @@ def run_pipeline(image_path, sigmaColor=35, sigmaSpace=None,
         verbose=verbose
     )
 
-    # Metrics
     band_mask, interior_mask = boundary_band_from_labels(imgClusters, radius=2)
     if lpips_fn is not None:
         orig_t = torch.from_numpy(orig_rgb.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
@@ -1255,6 +2208,33 @@ def run_pipeline(image_path, sigmaColor=35, sigmaSpace=None,
         'diag': diag,
     }
 
+def _run_one(args):
+    path, kwargs = args
+    return run_pipeline(path, **kwargs)
+
+def _run_decomposition_one(args):
+    path, config = args
+    return run_decomposition(path, config)
+
+def _run_boundary_one(args):
+    path, config = args
+    return run_boundary_comparison(path, config)
+
+########### v7.4 end-to-end functions #############
+
+########### Plotting and outputs ###########
+# Convert HxWx3 uint8 RGB to BCHW float
+def img_to_tensor(img_rgb):
+    t = torch.from_numpy(img_rgb.astype(np.float32)).permute(2, 0, 1).unsqueeze(0)
+    return (t / 127.5) - 1.0
+
+def compute_lpips(orig_rgb, rec_rgb):
+    with torch.no_grad():
+        return float(lpips_fn(img_to_tensor(orig_rgb), img_to_tensor(rec_rgb)))
+
+def compute_mse(orig_rgb, rec_rgb):
+    return float(np.mean((orig_rgb.astype(np.float32) - rec_rgb.astype(np.float32)) ** 2))
+
 def load_disjoint_splits(folder, sizes, seed=42):
     random.seed(seed)
     _img_exts = {'.jpg', '.jpeg', '.png', '.webp'}
@@ -1267,81 +2247,6 @@ def load_disjoint_splits(folder, sizes, seed=42):
         splits.append([os.path.join(folder, f) for f in filenames[idx:idx + size]])
         idx += size
     return splits
-
-def tune_hyperparameters(tune_images, sc_grid, ss_grid, ht_grid, lt_grid,
-                          smin_grid, smax_grid, bp_grid, cw_grid, rd_lambda=100, bpp_tol=0.05):
-    results_s1 = []
-    for sc in sc_grid:
-        for ss in ss_grid:
-            for ht in ht_grid:
-                for lt in lt_grid:
-                    with ProcessPoolExecutor(max_workers=10) as pool:
-                        scores = list(pool.map(_run_one, [(p, {'sigmaColor': sc, 'sigmaSpace': ss,
-                            'high_thresh': ht, 'low_thresh': lt, 'rd_lambda': rd_lambda}) for p in tune_images]))
-                    avg_psnr = np.mean([s['psnr'] for s in scores])
-                    avg_ssim = np.mean([s['ssim'] for s in scores])
-                    avg_bpp  = np.mean([s['bpp']  for s in scores])
-                    results_s1.append({'sigmaColor': sc, 'sigmaSpace': ss, 'high_thresh': ht,
-                        'low_thresh': lt, 'psnr': avg_psnr, 'ssim': avg_ssim, 'bpp': avg_bpp})
-                    print(f"[{time.strftime('%H:%M:%S')}] sc={sc} ss={ss} ht={ht} lt={lt}: "
-                          f"PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
-
-    target_bpp = min(r['bpp'] for r in results_s1)
-    best_s1 = max([r for r in results_s1 if r['bpp'] <= target_bpp * (1 + bpp_tol)],
-                  key=lambda r: r['psnr'])
-    print(f"\nBest S1: {best_s1}")
-
-    results_s2 = []
-    for smin in smin_grid:
-        for smax in smax_grid:
-            for bp in bp_grid:
-                for cw in cw_grid:
-                    cfg = {k: best_s1[k] for k in ['sigmaColor', 'sigmaSpace', 'high_thresh', 'low_thresh']}
-                    cfg.update({'spline_min_smooth': smin, 'spline_max_smooth': smax,
-                                'spline_base_perim': bp, 'complexity_weights': cw, 'rd_lambda': rd_lambda})
-                    with ProcessPoolExecutor(max_workers=10) as pool:
-                        scores = list(pool.map(_run_one, [(p, cfg) for p in tune_images]))
-                    avg_psnr = np.mean([s['psnr'] for s in scores])
-                    avg_ssim = np.mean([s['ssim'] for s in scores])
-                    avg_bpp  = np.mean([s['bpp']  for s in scores])
-                    results_s2.append({'smin': smin, 'smax': smax, 'bp': bp, 'cw': cw,
-                        'psnr': avg_psnr, 'ssim': avg_ssim, 'bpp': avg_bpp})
-                    print(f"[{time.strftime('%H:%M:%S')}] smin={smin} smax={smax} bp={bp} cw={cw}: "
-                          f"PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
-
-    target_bpp2 = min(r['bpp'] for r in results_s2)
-    best_s2 = max([r for r in results_s2 if r['bpp'] <= target_bpp2 * (1 + bpp_tol)],
-                  key=lambda r: r['psnr'])
-    print(f"\nBest S2: {best_s2}")
-
-    config = {k: best_s1[k] for k in ['sigmaColor', 'sigmaSpace', 'high_thresh', 'low_thresh']}
-    config.update({'spline_min_smooth': best_s2['smin'], 'spline_max_smooth': best_s2['smax'],
-                   'spline_base_perim': best_s2['bp'], 'complexity_weights': best_s2['cw'], 'rd_lambda': rd_lambda})
-    return config, results_s1, results_s2
-
-def validate_stability(stability_images, base_config, bpp_tol=0.05, perturbations=None):
-    if perturbations is None:
-        perturbations = {
-            'sigmaColor':        [-20, +20],
-            'high_thresh':       [-3.0, +3.0],
-            'spline_max_smooth': [-2.0, +2.0],
-        }
-    configs = [('selected', base_config)]
-    for param, deltas in perturbations.items():
-        for d in deltas:
-            neighbor = dict(base_config)
-            neighbor[param] = base_config[param] + d
-            configs.append((f"{param}{'+' if d > 0 else ''}{d}", neighbor))
-
-    results = []
-    for label, cfg in configs:
-        with ProcessPoolExecutor(max_workers=10) as pool:
-            scores = list(pool.map(_run_one, [(p, cfg) for p in stability_images]))
-        avg_psnr = np.mean([s['psnr'] for s in scores])
-        avg_bpp  = np.mean([s['bpp']  for s in scores])
-        results.append({'label': label, 'psnr': avg_psnr, 'bpp': avg_bpp})
-        print(f"  {label:30s}  PSNR={avg_psnr:.2f}  bpp={avg_bpp:.3f}")
-    return results
 
 def run_final_test(test_images, config):
     with ProcessPoolExecutor(max_workers=10) as pool:
@@ -1428,10 +2333,7 @@ def report_mode_allocation(images, config, rd_lambda, label):
         avg_ctrl = np.mean(totals[m]['ctrl_pts']) if totals[m]['ctrl_pts'] else 0.0
         avg_bytes = totals[m]['bytes'] / max(totals[m]['regions'], 1)
         print(f"{m:<10} {pct_r:>9.1f}% {pct_p:>9.1f}% {pct_b:>9.1f}% {avg_ctrl:>8.1f} {avg_bytes:>10.1f}")
-
-
     return totals
-
 
 def run_rd_sweep(images, config, lambdas, dct_qualities, lpips_fn=None):
     results = []
@@ -1478,7 +2380,7 @@ def encode_raster_baseline(images, codec, qualities):
         })
     return results
 
-def plot_rd_curves(ours, baselines, metric='psnr'):
+def plot_rd_curves(ours, baselines, metric='psnr', savepath=None):
     ylabel = {'psnr': 'PSNR (dB)', 'ssim': 'SSIM', 'lpips': 'LPIPS'}[metric]
     fig, ax = plt.subplots(figsize=(7, 5))
     pts = sorted(ours, key=lambda r: r['bpp'])
@@ -1495,7 +2397,10 @@ def plot_rd_curves(ours, baselines, metric='psnr'):
     ax.legend()
     plt.tight_layout()
     plt.show()
+    if savepath:
+        plt.savefig(savepath, format='svg', bbox_inches='tight')
     return fig, ax
+
 
 def run_threshold_sweep(images, sc_vals, tau_vals, base_config):
     grid = {}
@@ -1514,7 +2419,7 @@ def run_threshold_sweep(images, sc_vals, tau_vals, base_config):
                   f"regions={grid[(sc,tau)]['n_regions']:.0f}")
     return grid
 
-def plot_threshold_sweep(grid, sc_vals, tau_vals):
+def plot_threshold_sweep(grid, sc_vals, tau_vals, savepath=None):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     colors = plt.cm.viridis(np.linspace(0, 1, len(sc_vals)))
     for sc, color in zip(sc_vals, colors):
@@ -1529,8 +2434,31 @@ def plot_threshold_sweep(grid, sc_vals, tau_vals):
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
+        plt.tight_layout()
+    plt.show()
+    if savepath:
+        plt.savefig(savepath, format='svg', bbox_inches='tight')
+
+def plot_boundary_fig1(avg, savepath=None):
+    budgets = sorted(avg['param_matched'][next(iter(avg['param_matched']))].keys())
+    byte_budgets = sorted(avg['byte_matched'][next(iter(avg['byte_matched']))].keys())
+    colors = {'B-spline': 'steelblue', 'Bezier': 'darkorange', 'Chebyshev': 'forestgreen', 'Polynomial': 'crimson'}
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    for m in avg['param_matched']:
+        psnr_by_n = [avg['param_matched'][m][n]['psnr'] for n in budgets]
+        ax1.plot(budgets, psnr_by_n, marker='o', label=m, color=colors[m], linewidth=2)
+
+        psnr_by_byte = [avg['byte_matched'][m][B]['psnr'] for B in byte_budgets]
+        ax2.plot(byte_budgets, psnr_by_byte, marker='o', label=m, color=colors[m], linewidth=2)
+
+    ax1.set(xlabel='Control points N', ylabel='Boundary-band PSNR', title='Matched parameter budget')
+    ax2.set(xlabel='Byte budget', ylabel='Boundary-band PSNR', title='Matched byte budget')
+    ax1.legend(); ax2.legend(); ax1.grid(True, alpha=0.3); ax2.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
+    if savepath:
+        plt.savefig(savepath, format='svg', bbox_inches='tight')
 
 def run_timing_experiment(images, scales, config):
     tmp = '/tmp/_timing_img.png'
@@ -1550,7 +2478,7 @@ def run_timing_experiment(images, scales, config):
         print(f"  scale={scale:.2f}x: {np.mean(n_pix_list)/1e6:.2f}Mpx  {np.mean(runtimes):.2f}s")
     return results
 
-def plot_timing(results):
+def plot_timing(results, savepath=None):
     pts = sorted(results, key=lambda r: r['n_pixels'])
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot([r['n_pixels'] / 1e6 for r in pts], [r['runtime_s'] for r in pts], marker='o', linewidth=2)
@@ -1559,10 +2487,75 @@ def plot_timing(results):
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
+    if savepath:
+        plt.savefig(savepath, format='svg', bbox_inches='tight')
 
-def _run_one(args):
-    path, kwargs = args
-    return run_pipeline(path, **kwargs)
+def write_final_report(decomp_natural, decomp_structured, bnd_natural, bnd_structured,
+                        mode_natural, mode_structured, diag_natural, diag_structured,
+                        filepath='final_results.txt'):
+    with open(filepath, 'w') as f:
+        f.write("=" * 70 + "\nTABLE V - Error decomposition\n" + "=" * 70 + "\n")
+        for label, d in [('Natural', decomp_natural), ('Structured', decomp_structured)]:
+            f.write(f"\n{label}:\n")
+            for k, v in d.items():
+                f.write(f"  {k:8s} = {v:.4f}\n")
+
+        f.write("\n" + "=" * 70 + "\nTABLE VI - Matched parameter budget\n" + "=" * 70 + "\n")
+        for label, d in [('Natural', bnd_natural), ('Structured', bnd_structured)]:
+            f.write(f"\n{label}:\n")
+            methods = list(d['param_matched'].keys())
+            budgets = sorted(d['param_matched'][methods[0]].keys())
+            for metric in ['mae', 'psnr', 'ssim', 'iou', 'chamfer']:
+                f.write(f"\n  {metric.upper()}\n")
+                f.write(f"  {'N':>6}" + "".join(f"{m:>14}" for m in methods) + "\n")
+                for n in budgets:
+                    row = f"  {n:>6}"
+                    for m in methods:
+                        row += f"{d['param_matched'][m][n][metric]:>14.4f}"
+                    f.write(row + "\n")
+
+        f.write("\n" + "=" * 70 + "\nTABLE VII - Matched byte budget\n" + "=" * 70 + "\n")
+        for label, d in [('Natural', bnd_natural), ('Structured', bnd_structured)]:
+            f.write(f"\n{label}:\n")
+            methods = list(d['byte_matched'].keys())
+            byte_budgets = sorted(d['byte_matched'][methods[0]].keys())
+            for metric in ['n', 'mae', 'psnr', 'ssim']:
+                f.write(f"\n  {metric.upper()}\n")
+                f.write(f"  {'Budget':>8}" + "".join(f"{m:>14}" for m in methods) + "\n")
+                for B in byte_budgets:
+                    row = f"  {B:>8}"
+                    for m in methods:
+                        val = d['byte_matched'][m][B][metric]
+                        row += f"{val:>14.4f}" if metric != 'n' else f"{val:>14d}"
+                    f.write(row + "\n")
+
+        f.write("\n" + "=" * 70 + "\nTABLE IX - Mode allocation\n" + "=" * 70 + "\n")
+        for label, totals in [('Natural', mode_natural), ('Structured', mode_structured)]:
+            f.write(f"\n{label}:\n")
+            total_regions = sum(totals[m]['regions'] for m in totals)
+            total_pixels = sum(totals[m]['pixels'] for m in totals)
+            total_bytes = sum(totals[m]['bytes'] for m in totals)
+            f.write(f"  {'Mode':<10} {'%Regions':>10} {'%Pixels':>10} {'%Bytes':>10} {'Avg|P|':>8} {'AvgBytes':>10}\n")
+            for m in totals:
+                pct_r = 100 * totals[m]['regions'] / max(total_regions, 1)
+                pct_p = 100 * totals[m]['pixels'] / max(total_pixels, 1)
+                pct_b = 100 * totals[m]['bytes'] / max(total_bytes, 1)
+                avg_ctrl = np.mean(totals[m]['ctrl_pts']) if totals[m]['ctrl_pts'] else 0.0
+                avg_bytes = totals[m]['bytes'] / max(totals[m]['regions'], 1)
+                f.write(f"  {m:<10} {pct_r:>9.1f}% {pct_p:>9.1f}% {pct_b:>9.1f}% {avg_ctrl:>8.1f} {avg_bytes:>10.1f}\n")
+
+        f.write("\n" + "=" * 70 + "\nTABLE X - Reconstruction diagnostics\n" + "=" * 70 + "\n")
+        for label, d in [('Natural', diag_natural), ('Structured', diag_structured)]:
+            f.write(f"\n{label}:\n")
+            f.write(f"  Region count: initial={d['initial']} encoded={d['encoded']}\n")
+            f.write(f"  S/L ratio: {d['sl_ratio']:.2f}\n")
+            f.write(f"  Coverage repair: raster={100*d['cov_raster']:.2f}% "
+                    f"dilation/convolution={100*d['cov_repair']:.2f}% "
+                    f"nearest={100*d['cov_nearest']:.2f}%\n")
+
+    print(f"\nFinal results written to {filepath}")
+
+########### Plotting and outputs ###########s
 
 # %% [markdown]
 # Hyperparameter Tuning
@@ -1570,111 +2563,42 @@ def _run_one(args):
 # %%
 if __name__ == '__main__':
     warnings.filterwarnings("ignore")
+    # Initialize LPIPS
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', np.exceptions.RankWarning)
+        lpips_fn = lpips.LPIPS(net='alex', verbose=False)
 
+    # Load all images
     tune_images, stability_images = load_disjoint_splits('BSDS500/val', [15, 30], seed=42)
     val_svgs, test_svgs = load_disjoint_splits('svgs', [15, 30], seed=42)
+    kodak_images = [os.path.join('kodak', f) for f in sorted(os.listdir('kodak'))]
 
-    config_bsds = {
-        'sigmaColor': 350, 'sigmaSpace': 125, 'high_thresh': 120.0, 'low_thresh': 60.0,
-        'spline_min_smooth': 0.0, 'spline_max_smooth': 5.5, 'spline_base_perim': 320.0,
-        'complexity_weights': (0.40, 0.60),
-    }
-    config_svg = {
-        'sigmaColor': 85, 'sigmaSpace': 140, 'high_thresh': 20.0, 'low_thresh': 0.0,
-        'spline_min_smooth': 0.0, 'spline_max_smooth': 15.0, 'spline_base_perim': 205.0,
-        'complexity_weights': (0.40, 0.60),
-    }
-    
-    # ===== STEP 1: Lambda calibration =====
-    '''
-    calib_natural = tune_images[:5]
-    calib_structured = val_svgs[:5]
+    # Read in hyperparameters
+    config_bsds = json.load(open('tuned_config.json'))['natural']
+    config_svg = json.load(open('tuned_config.json'))['structured']
 
-    lam_grid = [.1, .3, .5, 1, 2, 5, 10, 20, 30, 60, 80, 100, 120, 150, 180, 200, 300, 400, 500, 550, 700, 1000]
-
-    for ds_name, calib_images, base_cfg in [('natural', calib_natural, config_bsds), ('structured', calib_structured, config_svg)]:
-        print(f"\nLambda calibration ({ds_name}):")
-        for lam in lam_grid:
-            cfg = dict(base_cfg)
-            cfg.update({'rd_lambda': lam, 'verbose': False})
-            scores = [run_pipeline(p, **cfg) for p in calib_images]
-            avg_psnr = np.mean([s['psnr'] for s in scores])
-            avg_bpp  = np.mean([s['bpp']  for s in scores])
-            tier0_regions_pct = 100 * np.mean([s['diag']['tier_counts'][0] / max(sum(s['diag']['tier_counts']), 1) for s in scores])
-            tier0_pixels_pct  = 100 * np.mean([s['diag']['tier_pixel_counts'][0] / max(sum(s['diag']['tier_pixel_counts']), 1) for s in scores])
-            print(f"  lam={lam:6.2f}  PSNR={avg_psnr:.4f}  bpp={avg_bpp:.4f}  tier0_regions={tier0_regions_pct:.1f}%  tier0_pixels={tier0_pixels_pct:.2f}%")
-    '''
-            
-    # ===== STEP 2: Hyperparameter tuning + stability testing =====
-    
-    sc_grid_bsds  = [170, 180, 190, 200, 210, 230, 250, 270, 290, 320, 350, 400, 450, 600, 900]
-    ss_grid_bsds  = [85, 105, 125, 135, 145, 155, 165]
-    ht_grid_bsds  = [24, 26, 28, 30, 32, 36, 40, 45, 50, 65, 80, 120, 200, 300, 500]
-    lt_grid_bsds  = [8.5, 9.5, 10.5, 11.5, 12.5, 14.5, 16.5, 19.5, 22.5, 30, 37.5, 45, 60, 100, 150]
-    smin_grid_bsds = [0.0, 0.25, 0.5, 1.0, 1.5, 2.0]
-    smax_grid_bsds = [3.5, 4.0, 4.5, 5.0, 5.5, 7.0, 8.5]
-    bp_grid_bsds   = [280.0, 290.0, 300.0, 310.0, 320.0, 350.0, 380.0]
-    cw_grid_bsds   = [(0.30, 0.70), (0.35, 0.65), (0.40, 0.60), (0.45, 0.55), (0.50, 0.50)]
-
-
-    sc_grid_svg  = [65, 75, 85, 95, 105]
-    ss_grid_svg  = [100, 110, 120, 130, 140, 160, 180]
-    ht_grid_svg  = [8.0, 11.0, 14.0, 16.0, 18.0, 20.0, 22.0, 25.0, 30.0]
-    lt_grid_svg  = [0.0, 1.0, 2.0, 3.0]
-    smin_grid_svg = [0.0, 0.5, 1.0, 1.5]
-    smax_grid_svg = [7.0, 8.0, 9.0, 10.0, 11.0, 13.0, 15.0]
-    bp_grid_svg   = [165.0, 185.0, 205.0, 215.0, 225.0, 235.0, 245.0]
-    cw_grid_svg   = [(0.30, 0.70), (0.35, 0.65), (0.40, 0.60), (0.45, 0.55), (0.50, 0.50)]
-    
-    config_bsds, _, _ = tune_hyperparameters(
-        tune_images,
-        sc_grid=sc_grid_bsds, 
-        ss_grid=ss_grid_bsds, 
-        ht_grid=ht_grid_bsds, 
-        lt_grid=lt_grid_bsds,
-        smin_grid=smin_grid_bsds, 
-        smax_grid=smax_grid_bsds, 
-        bp_grid=bp_grid_bsds, 
-        cw_grid=cw_grid_bsds, 
-        rd_lambda=100,
-    )
-    print("\nStability check (BSDS):")
-    validate_stability(stability_images, config_bsds)
-    
-    config_svg, _, _ = tune_hyperparameters(
-        val_svgs,
-        sc_grid=sc_grid_svg, 
-        ss_grid=ss_grid_svg, 
-        ht_grid=ht_grid_svg, 
-        lt_grid=lt_grid_svg,
-        smin_grid=smin_grid_svg, 
-        smax_grid=smax_grid_svg, 
-        bp_grid=bp_grid_svg, 
-        cw_grid=cw_grid_svg, 
-        rd_lambda=100,
-    )
-    print("\nStability check (structured):")
-    validate_stability(test_svgs, config_svg)
-
-    tuned_config = {
-        'natural':    config_bsds,
-        'structured': config_svg,
-    }
-    with open('tuned_config.json', 'w') as f:
-        json.dump(tuned_config, f, indent=2)
-    
-    '''
-    # ===== STEP 3: Final numbers =====
+    # Set up figure formatting
     FIGURE_DIR = 'paper_figures'
     os.makedirs(FIGURE_DIR, exist_ok=True)
     plt.rcParams.update({'font.size': 11, 'axes.titlesize': 12, 'figure.dpi': 150})
 
-    kodak_images = [os.path.join('kodak', f) for f in sorted(os.listdir('kodak'))]
+    # ===== Run final end-to-end pipeline ===== 
     print("\nBSDS final:")
     run_final_test(kodak_images, config_bsds)
     print("\nStructured final:")
     run_final_test(test_svgs, config_svg)
-    
+
+    # ===== v7.2 Testing ===== 
+    decomp_natural = aggregate_decomposition(kodak_images, config_bsds, 'Natural')
+    decomp_structured = aggregate_decomposition(test_svgs, config_svg, 'Structured')
+
+    # ===== v7.3 Testing ===== 
+    bnd_natural = aggregate_boundary_comparison(kodak_images, config_bsds, 'Natural')
+    bnd_structured = aggregate_boundary_comparison(test_svgs, config_svg, 'Structured')
+    plot_boundary_fig1(bnd_natural, savepath='paper_figures/fig1_boundary_natural.svg')
+    plot_boundary_fig1(bnd_structured, savepath='paper_figures/fig1_boundary_structured.svg')
+
+    # ===== v7.4 Testing ===== 
     # R-D sweep — sweep lambda with fixed dct_quality; adjust ranges after lambda calibration
     lp_fn = lpips.LPIPS(net='alex', verbose=False)
     lam_grid_final = [10, 30, 60, 100, 200, 400, 700, 1000]
@@ -1693,14 +2617,14 @@ if __name__ == '__main__':
     webp_structured = encode_raster_baseline(test_svgs,   'webp', webp_q)
     
     print("\nR-D curves (natural):")
-    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='psnr')
-    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='ssim')
-    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='lpips')
+    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='psnr', savepath='paper_figures/fig3_rd_natural_psnr.svg')
+    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='ssim', savepath='paper_figures/fig3_rd_natural_ssim.svg')
+    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='lpips', savepath='paper_figures/fig3_rd_natural_lpips.svg')
     
     print("\nR-D curves (structured):")
-    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='psnr')
-    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='ssim')
-    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='lpips')
+    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='psnr', savepath='paper_figures/fig3_rd_structured_psnr.svg')
+    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='ssim', savepath='paper_figures/fig3_rd_structured_ssim.svg')
+    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='lpips', savepath='paper_figures/fig3_rd_structured_lpips.svg')
     
     # Threshold sweep for Fig 2 — run on stability set (disjoint from test)
     sc_sweep_natural  = [250, 300, 350, 400, 450]
@@ -1709,12 +2633,11 @@ if __name__ == '__main__':
     tau_sweep_svg = [5, 10, 14, 17, 20, 23, 25, 28, 30]
 
     print("\nThreshold sweep (natural):")
-    thresh_grid_natural = run_threshold_sweep(stability_images[:8], sc_sweep_natural, sc_sweep_natural, config_bsds)
-    plot_threshold_sweep(thresh_grid_natural, sc_sweep_natural, sc_sweep_natural)
-
+    thresh_grid_natural = run_threshold_sweep(stability_images[:8], sc_sweep_natural, tau_sweep_natural, config_bsds)
+    plot_threshold_sweep(thresh_grid_natural, sc_sweep_natural, tau_sweep_natural, savepath='paper_figures/fig2_threshold_natural.svg')
     print("\nThreshold sweep (structured):")
     thresh_grid_svg = run_threshold_sweep(val_svgs[:8], sc_sweep_svg, tau_sweep_svg, config_svg)
-    plot_threshold_sweep(thresh_grid_svg, sc_sweep_svg, tau_sweep_svg)
+    plot_threshold_sweep(thresh_grid_svg, sc_sweep_svg, tau_sweep_svg, savepath='paper_figures/fig2_threshold_structured.svg')
     
     # Table IX
     mode_natural = report_mode_allocation(kodak_images, config_bsds, rd_lambda=100, label='Natural')
@@ -1729,8 +2652,11 @@ if __name__ == '__main__':
     scales = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
     print("\nTiming experiment (natural):")
     timing_natural = run_timing_experiment(timing_images, scales, config_bsds)
-    plot_timing(timing_natural)
+    plot_timing(timing_natural, savepath='paper_figures/fig4_timing_natural.svg')
     print("\nTiming experiment (structured):")
     timing_structured = run_timing_experiment(test_svgs[:6], scales, config_svg)
-    plot_timing(timing_structured)
-    '''
+    plot_timing(timing_structured, savepath='paper_figures/fig4_timing_structured.svg')
+
+    # Write results to file
+    write_final_report(decomp_natural, decomp_structured, bnd_natural, bnd_structured,
+                        mode_natural, mode_structured, diag_natural, diag_structured)

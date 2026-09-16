@@ -1,0 +1,28 @@
+{
+  "natural": {
+    "sigmaColor": 350,
+    "sigmaSpace": 125,
+    "high_thresh": 120.0,
+    "low_thresh": 60.0,
+    "spline_min_smooth": 0.0,
+    "spline_max_smooth": 5.5,
+    "spline_base_perim": 320.0,
+    "complexity_weights": [
+      0.4,
+      0.6
+    ]
+  },
+  "structured": {
+    "sigmaColor": 85,
+    "sigmaSpace": 140,
+    "high_thresh": 20.0,
+    "low_thresh": 0.0,
+    "spline_min_smooth": 0.0,
+    "spline_max_smooth": 15.0,
+    "spline_base_perim": 205.0,
+    "complexity_weights": [
+      0.4,
+      0.6
+    ]
+  }
+}
