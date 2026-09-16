@@ -764,8 +764,9 @@ def run_encode_decode(
         spline_base_perim=200.0,
         complexity_weights=(0.6, 0.4),
         corner_thresh_deg=35.0,
-        rd_lambda=.001,
-        rd_dct_quality=35
+        rd_lambda=100,
+        rd_dct_quality=35,
+        verbose=False
     ):
     min_points = 6
     min_area = 4.0
@@ -775,6 +776,7 @@ def run_encode_decode(
     tier_counts = [0, 0, 0]
     tier_pixel_counts = [0, 0, 0]
     tier_byte_counts = [0, 0, 0]
+    tier_ctrl_pts = [[], [], []]
     # overflow logging
     CAST_LOG = {}
     CAST_LOG.clear()
@@ -804,6 +806,7 @@ def run_encode_decode(
             wrote_geom = False
             geom_lines = []
             geom_bin = None
+            n_ctrl = 0
 
             if tck is not None:
                 t, c, k = tck
@@ -828,6 +831,7 @@ def run_encode_decode(
                         cyD.astype('<i4').tobytes()
                     )
                     wrote_geom = True
+                    n_ctrl = len(cxD)
 
             # Fallback if spline failed
             if not wrote_geom:
@@ -842,6 +846,7 @@ def run_encode_decode(
                     )
                     wrote_geom = True
                     fallback_ok += 1
+                    n_ctrl = len(dr)
 
             if wrote_geom:
                 # --- planar model fit ---
@@ -855,6 +860,7 @@ def run_encode_decode(
                 tier_counts[tier] += 1
                 ys_r, _ = np.where(region_mask)
                 tier_pixel_counts[tier] += len(ys_r)
+                tier_ctrl_pts[tier].append(n_ctrl)
                 if tier == 0:
                     tier_byte_counts[tier] += 23 + len(geom_bin)
                 elif tier == 1:
@@ -906,7 +912,7 @@ def run_encode_decode(
                     ph, pw = qcoeff.shape[:2]
                     nz_idx = np.argwhere(qcoeff != 0)
                     fb.write(struct.pack('<HHHH', r0b, c0b, H_b, W_b))
-                    fb.write(struct.pack('<H', len(nz_idx)))
+                    fb.write(struct.pack('<I', len(nz_idx)))
                     for idx in nz_idx:
                         y_i, x_i, ch_i = idx
                         pos = int(ch_i) * ph * pw + int(y_i) * pw + int(x_i)
@@ -921,15 +927,16 @@ def run_encode_decode(
         fb.write(struct.pack('<I', encoded_ok))
     spline_count = encoded_ok - fallback_ok
     total = encoded_ok
-    print(f"S (spline):   {spline_count}/{total} = {spline_count/total*100:.1f}%")
-    print(f"L (fallback): {fallback_ok}/{total} = {fallback_ok/total*100:.1f}%")
-    print(f"Dropped:      {dropped}")
+    if verbose:
+        print(f"S (spline):   {spline_count}/{total} = {spline_count/total*100:.1f}%")
+        print(f"L (fallback): {fallback_ok}/{total} = {fallback_ok/total*100:.1f}%")
+        print(f"Dropped:      {dropped}")
 
-    print("\nFixed-width cast report:")
-    for label, e in sorted(CAST_LOG.items()):
-        pct = 100 * e["n_clipped"] / max(e["n_total"], 1)
-        print(f"  {label:16s} max_abs    ={e['max_abs']:10.1f} / limit {e['limit']:6d}"
-            f"   clipped {e['n_clipped']}/{e['n_total']} ({pct:.3f}%)")
+        print("\nFixed-width cast report:")
+        for label, e in sorted(CAST_LOG.items()):
+            pct = 100 * e["n_clipped"] / max(e["n_total"], 1)
+            print(f"  {label:16s} max_abs    ={e['max_abs']:10.1f} / limit {e['limit']:6d}"
+                f"   clipped {e['n_clipped']}/{e['n_total']} ({pct:.3f}%)")
         
     # 1. Count byte frequencies across the full binary file
     data = open(bin_path, "rb").read()
@@ -976,15 +983,17 @@ def run_encode_decode(
         fh.write(struct.pack('<B', padding))
         fh.write(bytes(encoded))
 
-    print(f"[PID {pid}] Huffman: {os.path.getsize(huff_path)} Binary: {os.path.getsize(bin_path)} Text: {os.path.getsize(txt_path)}")
+    if verbose:
+        print(f"[PID {pid}] Huffman: {os.path.getsize(huff_path)} Binary: {os.path.getsize(bin_path)} Text: {os.path.getsize(txt_path)}")
 
     total_px = max(sum(tier_pixel_counts), 1)
     total_b = max(sum(tier_byte_counts), 1)
     names = ['linear', 'quadratic', 'DCT']
-    for i, name in enumerate(names):
-        print(f"Tier {i} ({name}): regions {tier_counts[i]}/{encoded_ok} ({tier_counts[i]/encoded_ok*100:.1f}%)"
-            f"  pixels {tier_pixel_counts[i]/total_px*100:.1f}%"
-            f"  bytes {tier_byte_counts[i]/total_b*100:.1f}%")
+    if verbose:
+        for i, name in enumerate(names):
+            print(f"Tier {i} ({name}): regions {tier_counts[i]}/{encoded_ok} ({tier_counts[i]/encoded_ok*100:.1f}%))"
+                f"  pixels {tier_pixel_counts[i]/total_px*100:.1f}%"
+                f"  bytes {tier_byte_counts[i]/total_b*100:.1f}%")
 
     # Conversion of huffman to binary stream
 
@@ -1094,7 +1103,7 @@ def run_encode_decode(
                 block = 8
                 ph = H_d + (block - H_d % block) % block
                 pw = W_d + (block - W_d % block) % block
-                n_nz = struct.unpack('<H', fb.read(2))[0]
+                n_nz = struct.unpack('<I', fb.read(4))[0]
                 qcoeff = np.zeros((ph, pw, 3), dtype=np.int16)
                 for _ in range(n_nz):
                     pos = struct.unpack('<I', fb.read(4))[0]
@@ -1168,6 +1177,7 @@ def run_encode_decode(
         'tier_counts': tier_counts,
         'tier_pixel_counts': tier_pixel_counts,
         'tier_byte_counts': tier_byte_counts,
+        'tier_ctrl_pts': tier_ctrl_pts,
         'spline_count': spline_count,
         'fallback_ok': fallback_ok,
         'dropped': dropped,
@@ -1184,7 +1194,7 @@ def run_pipeline(image_path, sigmaColor=35, sigmaSpace=None,
                  low_complexity=2.0, high_complexity=12.0, window_size=7,
                  spline_min_smooth=0.0, spline_max_smooth=20.0, spline_base_perim=200.0,
                  complexity_weights=(0.6, 0.4), corner_thresh_deg=35.0,
-                 rd_lambda=0.001, rd_dct_quality=35, lpips_fn=None):
+                 rd_lambda=100, rd_dct_quality=35, lpips_fn=None, verbose=False):
     
     # Run full encode-decode pipeline on one image, return metrics dict.
     if sigmaSpace is None:
@@ -1216,7 +1226,8 @@ def run_pipeline(image_path, sigmaColor=35, sigmaSpace=None,
         complexity_weights=complexity_weights,
         corner_thresh_deg=corner_thresh_deg,
         rd_lambda=rd_lambda,
-        rd_dct_quality=rd_dct_quality
+        rd_dct_quality=rd_dct_quality,
+        verbose=verbose
     )
 
     # Metrics
@@ -1257,7 +1268,7 @@ def load_disjoint_splits(folder, sizes, seed=42):
     return splits
 
 def tune_hyperparameters(tune_images, sc_grid, ss_grid, ht_grid, lt_grid,
-                          smin_grid, smax_grid, bp_grid, cw_grid, bpp_tol=0.05):
+                          smin_grid, smax_grid, bp_grid, cw_grid, rd_lambda=100, bpp_tol=0.05):
     results_s1 = []
     for sc in sc_grid:
         for ss in ss_grid:
@@ -1265,7 +1276,7 @@ def tune_hyperparameters(tune_images, sc_grid, ss_grid, ht_grid, lt_grid,
                 for lt in lt_grid:
                     with ProcessPoolExecutor(max_workers=10) as pool:
                         scores = list(pool.map(_run_one, [(p, {'sigmaColor': sc, 'sigmaSpace': ss,
-                            'high_thresh': ht, 'low_thresh': lt}) for p in tune_images]))
+                            'high_thresh': ht, 'low_thresh': lt, 'rd_lambda': rd_lambda}) for p in tune_images]))
                     avg_psnr = np.mean([s['psnr'] for s in scores])
                     avg_ssim = np.mean([s['ssim'] for s in scores])
                     avg_bpp  = np.mean([s['bpp']  for s in scores])
@@ -1286,7 +1297,7 @@ def tune_hyperparameters(tune_images, sc_grid, ss_grid, ht_grid, lt_grid,
                 for cw in cw_grid:
                     cfg = {k: best_s1[k] for k in ['sigmaColor', 'sigmaSpace', 'high_thresh', 'low_thresh']}
                     cfg.update({'spline_min_smooth': smin, 'spline_max_smooth': smax,
-                                'spline_base_perim': bp, 'complexity_weights': cw})
+                                'spline_base_perim': bp, 'complexity_weights': cw, 'rd_lambda': rd_lambda})
                     with ProcessPoolExecutor(max_workers=10) as pool:
                         scores = list(pool.map(_run_one, [(p, cfg) for p in tune_images]))
                     avg_psnr = np.mean([s['psnr'] for s in scores])
@@ -1304,7 +1315,7 @@ def tune_hyperparameters(tune_images, sc_grid, ss_grid, ht_grid, lt_grid,
 
     config = {k: best_s1[k] for k in ['sigmaColor', 'sigmaSpace', 'high_thresh', 'low_thresh']}
     config.update({'spline_min_smooth': best_s2['smin'], 'spline_max_smooth': best_s2['smax'],
-                   'spline_base_perim': best_s2['bp'], 'complexity_weights': best_s2['cw']})
+                   'spline_base_perim': best_s2['bp'], 'complexity_weights': best_s2['cw'], 'rd_lambda': rd_lambda})
     return config, results_s1, results_s2
 
 def validate_stability(stability_images, base_config, bpp_tol=0.05, perturbations=None):
@@ -1339,6 +1350,87 @@ def run_final_test(test_images, config):
     avg_bpp  = np.mean([s['bpp']  for s in scores])
     print(f"\nFINAL TEST (n={len(test_images)}): PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
     return {'psnr': avg_psnr, 'ssim': avg_ssim, 'bpp': avg_bpp, 'per_image': scores}
+
+def report_diagnostics(images, config, rd_lambda, label):
+    cfg = dict(config)
+    cfg['rd_lambda'] = rd_lambda
+    cfg['verbose'] = False
+
+    initial_total = 0
+    encoded_total = 0
+    spline_total = 0
+    fallback_total = 0
+    cov_raster_list = []
+    cov_repair_list = []
+    cov_nearest_list = []
+    overflow_pcts = []
+
+    for path in images:
+        result = run_pipeline(path, **cfg)
+        diag = result['diag']
+        initial_total += result['n_regions']
+        encoded_total += diag['encoded_ok']
+        spline_total += diag['spline_count']
+        fallback_total += diag['fallback_ok']
+        cov_raster_list.append(diag['cov_raster'])
+        cov_repair_list.append(diag['cov_repair'])
+        cov_nearest_list.append(diag['cov_nearest'])
+
+    print(f"\n{label} (lambda={rd_lambda}):")
+    print(f"  Region count: initial={initial_total} encoded={encoded_total}")
+    sl_ratio = spline_total / max(fallback_total, 1)
+    print(f"  S/L ratio: {sl_ratio:.2f} (spline={spline_total}, fallback={fallback_total})")
+    print(f"  Coverage repair: raster={100*np.mean(cov_raster_list):.2f}% "
+          f"final_after_dilation_convolution={100*np.mean(cov_repair_list):.2f}% "
+          f"final_after_nearest={100*np.mean(cov_nearest_list):.2f}%")
+
+    return {
+        'initial': initial_total, 'encoded': encoded_total, 'sl_ratio': sl_ratio,
+        'cov_raster': np.mean(cov_raster_list), 'cov_repair': np.mean(cov_repair_list),
+        'cov_nearest': np.mean(cov_nearest_list),
+    }
+
+def report_mode_allocation(images, config, rd_lambda, label):
+    cfg = dict(config)
+    cfg['rd_lambda'] = rd_lambda
+    cfg['verbose'] = False
+
+    mode_names = ['Linear', 'Quadratic', 'DCT']
+    totals = {m: {'regions': 0, 'pixels': 0, 'bytes': 0, 'ctrl_pts': [], 'byte_costs': []} for m in mode_names}
+    total_regions = 0
+    total_pixels = 0
+    total_bytes = 0
+
+    for path in images:
+        result = run_pipeline(path, **cfg)
+        diag = result['diag']
+        tier_counts = diag['tier_counts']
+        tier_pixel_counts = diag['tier_pixel_counts']
+        tier_byte_counts = diag['tier_byte_counts']
+
+        total_regions += sum(tier_counts)
+        total_pixels += sum(tier_pixel_counts)
+        total_bytes += sum(tier_byte_counts)
+
+        for i, m in enumerate(mode_names):
+            totals[m]['regions'] += tier_counts[i]
+            totals[m]['pixels'] += tier_pixel_counts[i]
+            totals[m]['bytes'] += tier_byte_counts[i]
+            totals[m]['ctrl_pts'].extend(diag['tier_ctrl_pts'][i])
+
+    print(f"\n{label} (lambda={rd_lambda}):")
+    print(f"{'Mode':<10} {'%Regions':>10} {'%Pixels':>10} {'%Bytes':>10} {'Avg|P|':>8} {'AvgBytes':>10}")
+    for m in mode_names:
+        pct_r = 100 * totals[m]['regions'] / max(total_regions, 1)
+        pct_p = 100 * totals[m]['pixels'] / max(total_pixels, 1)
+        pct_b = 100 * totals[m]['bytes'] / max(total_bytes, 1)
+        avg_ctrl = np.mean(totals[m]['ctrl_pts']) if totals[m]['ctrl_pts'] else 0.0
+        avg_bytes = totals[m]['bytes'] / max(totals[m]['regions'], 1)
+        print(f"{m:<10} {pct_r:>9.1f}% {pct_p:>9.1f}% {pct_b:>9.1f}% {avg_ctrl:>8.1f} {avg_bytes:>10.1f}")
+
+
+    return totals
+
 
 def run_rd_sweep(images, config, lambdas, dct_qualities, lpips_fn=None):
     results = []
@@ -1478,68 +1570,141 @@ def _run_one(args):
 if __name__ == '__main__':
     warnings.filterwarnings("ignore")
 
-    # BSDS500: 15 tune, 30 stability (disjoint, never overlapping)
     tune_images, stability_images = load_disjoint_splits('BSDS500/val', [15, 30], seed=42)
+    val_svgs, test_svgs = load_disjoint_splits('svgs', [15, 30], seed=42)
+
+    config_bsds = {
+        'sigmaColor': 350, 'sigmaSpace': 125, 'high_thresh': 120.0, 'low_thresh': 60.0,
+        'spline_min_smooth': 0.0, 'spline_max_smooth': 5.5, 'spline_base_perim': 320.0,
+        'complexity_weights': (0.40, 0.60),
+    }
+    config_svg = {
+        'sigmaColor': 85, 'sigmaSpace': 140, 'high_thresh': 20.0, 'low_thresh': 0.0,
+        'spline_min_smooth': 0.0, 'spline_max_smooth': 15.0, 'spline_base_perim': 205.0,
+        'complexity_weights': (0.40, 0.60),
+    }
+    
+    # ===== STEP 1: Lambda calibration =====
+    '''
+    calib_natural = tune_images[:5]
+    calib_structured = val_svgs[:5]
+
+    lam_grid = [.1, .3, .5, 1, 2, 5, 10, 20, 30, 60, 80, 100, 120, 150, 180, 200, 300, 400, 500, 550, 700, 1000]
+
+    for ds_name, calib_images, base_cfg in [('natural', calib_natural, config_bsds), ('structured', calib_structured, config_svg)]:
+        print(f"\nLambda calibration ({ds_name}):")
+        for lam in lam_grid:
+            cfg = dict(base_cfg)
+            cfg.update({'rd_lambda': lam, 'verbose': False})
+            scores = [run_pipeline(p, **cfg) for p in calib_images]
+            avg_psnr = np.mean([s['psnr'] for s in scores])
+            avg_bpp  = np.mean([s['bpp']  for s in scores])
+            tier0_regions_pct = 100 * np.mean([s['diag']['tier_counts'][0] / max(sum(s['diag']['tier_counts']), 1) for s in scores])
+            tier0_pixels_pct  = 100 * np.mean([s['diag']['tier_pixel_counts'][0] / max(sum(s['diag']['tier_pixel_counts']), 1) for s in scores])
+            print(f"  lam={lam:6.2f}  PSNR={avg_psnr:.4f}  bpp={avg_bpp:.4f}  tier0_regions={tier0_regions_pct:.1f}%  tier0_pixels={tier0_pixels_pct:.2f}%")
+    '''
+            
+    # ===== STEP 2: Hyperparameter tuning + stability testing =====
+    '''
+    sc_grid_bsds  = [170, 180, 190, 200, 210, 230, 250, 270, 290, 320, 350, 400, 450, 600, 900]
+    ss_grid_bsds  = [85, 105, 125, 135, 145, 155, 165]
+    ht_grid_bsds  = [24, 26, 28, 30, 32, 36, 40, 45, 50, 65, 80, 120, 200, 300, 500]
+    lt_grid_bsds  = [8.5, 9.5, 10.5, 11.5, 12.5, 14.5, 16.5, 19.5, 22.5, 30, 37.5, 45, 60, 100, 150]
+    smin_grid_bsds = [0.0, 0.25, 0.5, 1.0, 1.5, 2.0]
+    smax_grid_bsds = [3.5, 4.0, 4.5, 5.0, 5.5, 7.0, 8.5]
+    bp_grid_bsds   = [280.0, 290.0, 300.0, 310.0, 320.0, 350.0, 380.0]
+    cw_grid_bsds   = [(0.30, 0.70), (0.35, 0.65), (0.40, 0.60), (0.45, 0.55), (0.50, 0.50)]
+
+
+    sc_grid_svg  = [65, 75, 85, 95, 105]
+    ss_grid_svg  = [100, 110, 120, 130, 140, 160, 180]
+    ht_grid_svg  = [8.0, 11.0, 14.0, 16.0, 18.0, 20.0, 22.0, 25.0, 30.0]
+    lt_grid_svg  = [0.0, 1.0, 2.0, 3.0]
+    smin_grid_svg = [0.0, 0.5, 1.0, 1.5]
+    smax_grid_svg = [7.0, 8.0, 9.0, 10.0, 11.0, 13.0, 15.0]
+    bp_grid_svg   = [165.0, 185.0, 205.0, 215.0, 225.0, 235.0, 245.0]
+    cw_grid_svg   = [(0.30, 0.70), (0.35, 0.65), (0.40, 0.60), (0.45, 0.55), (0.50, 0.50)]
 
     config_bsds, _, _ = tune_hyperparameters(
         tune_images,
-        sc_grid=[190], ss_grid=[145], ht_grid=[28.0], lt_grid=[10.5],
-        smin_grid=[1.0], smax_grid=[4.5], bp_grid=[300.0], cw_grid=[(0.40, 0.60)],
+        sc_grid=sc_grid_bsds, 
+        ss_grid=ss_grid_bsds, 
+        ht_grid=ht_grid_bsds, 
+        lt_grid=lt_grid_bsds,
+        smin_grid=smin_grid_bsds, 
+        smax_grid=smax_grid_bsds, 
+        bp_grid=bp_grid_bsds, 
+        cw_grid=cw_grid_bsds, 
+        rd_lambda=100,
     )
     print("\nStability check (BSDS):")
     validate_stability(stability_images, config_bsds)
-
-    val_svgs, test_svgs = load_disjoint_splits('svgs', [15, 23], seed=42)
-
+    
     config_svg, _, _ = tune_hyperparameters(
         val_svgs,
-        sc_grid=[85], ss_grid=[120], ht_grid=[18.0], lt_grid=[0.0],
-        smin_grid=[0.0], smax_grid=[9.0], bp_grid=[225.0], cw_grid=[(0.40, 0.60)],
+        sc_grid=sc_grid_svg, 
+        ss_grid=ss_grid_svg, 
+        ht_grid=ht_grid_svg, 
+        lt_grid=lt_grid_svg,
+        smin_grid=smin_grid_svg, 
+        smax_grid=smax_grid_svg, 
+        bp_grid=bp_grid_svg, 
+        cw_grid=cw_grid_svg, 
+        rd_lambda=100,
     )
     print("\nStability check (structured):")
     validate_stability(test_svgs, config_svg)
+    '''
 
-    # Final test on held-out sets
+    # ===== STEP 3: Final numbers =====
     kodak_images = [os.path.join('kodak', f) for f in sorted(os.listdir('kodak'))]
     print("\nBSDS final:")
     run_final_test(kodak_images, config_bsds)
     print("\nStructured final:")
     run_final_test(test_svgs, config_svg)
-
+    
     # R-D sweep — sweep lambda with fixed dct_quality; adjust ranges after lambda calibration
     lp_fn = lpips.LPIPS(net='alex', verbose=False)
-    lam_grid = [0.5, 1.0, 2.0, 5.0, 10.0]
+    lam_grid_final = [0.5, 1.0, 2.0, 5.0, 10.0]
     dct_q_grid = [25, 35, 50]
-
+    
     print("\nR-D sweep (natural):")
-    rd_natural = run_rd_sweep(kodak_images, config_bsds, lam_grid, dct_q_grid, lpips_fn=lp_fn)
+    rd_natural = run_rd_sweep(kodak_images, config_bsds, lam_grid_final, dct_q_grid, lpips_fn=lp_fn)
     print("\nR-D sweep (structured):")
-    rd_structured = run_rd_sweep(test_svgs, config_svg, lam_grid, dct_q_grid, lpips_fn=lp_fn)
-
+    rd_structured = run_rd_sweep(test_svgs, config_svg, lam_grid_final, dct_q_grid, lpips_fn=lp_fn)
+    
     jpeg_q = [10, 20, 30, 50, 70, 85, 95]
     webp_q = [10, 20, 30, 50, 70, 85, 95]
     jpeg_natural    = encode_raster_baseline(kodak_images, 'jpeg', jpeg_q)
     webp_natural    = encode_raster_baseline(kodak_images, 'webp', webp_q)
     jpeg_structured = encode_raster_baseline(test_svgs,   'jpeg', jpeg_q)
     webp_structured = encode_raster_baseline(test_svgs,   'webp', webp_q)
-
+    
     print("\nR-D curves (natural):")
     plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='psnr')
     plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='ssim')
     plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='lpips')
-
+    
     print("\nR-D curves (structured):")
     plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='psnr')
     plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='ssim')
     plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='lpips')
-
+    
     # Threshold sweep for Fig 2 — run on stability set (disjoint from test)
     sc_sweep = [100, 150, 190, 230]
     tau_sweep = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0]
     print("\nThreshold sweep (natural):")
     thresh_grid_natural = run_threshold_sweep(stability_images[:8], sc_sweep, tau_sweep, config_bsds)
     plot_threshold_sweep(thresh_grid_natural, sc_sweep, tau_sweep)
-
+    
+    # Table IX
+    mode_natural = report_mode_allocation(kodak_images, config_bsds, rd_lambda=100, label='Natural')
+    mode_structured = report_mode_allocation(test_svgs, config_svg, rd_lambda=100, label='Structured')
+    
+    # Table X
+    diag_natural = report_diagnostics(kodak_images, config_bsds, rd_lambda=100, label='Natural')
+    diag_structured = report_diagnostics(test_svgs, config_svg, rd_lambda=100, label='Structured')
+    
     # Timing experiment for Fig 4
     timing_images = kodak_images[:6]
     scales = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0]

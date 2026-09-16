@@ -122,11 +122,11 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 - **Current file:** `v7.3FuncCompress.ipynb`
 - Verify matched parameter budgets for B-spline vs. Bezier comparison
 
-### v7.4 Held out Validation Set Hyperparameter Tuning
+### v7.4 Held out set for hyperparameter tuning, validation, and testing
 - **Current file:** `v7.4FuncCompress.ipynb`
 - Put everything inside functions and iterating through hyperparameter options
-- BSDS500: sigmaColor=190, sigmaSpace=145, high_thresh=28.0, low_thresh=10.5, smin=1.0, smax=4.5, bp=300.0, cw=(0.4, 0.6) (PSNR=28.38)
-- SVG: sigmaColor=85, sigmaSpace=120, high_thresh=18.0, low_thresh=0.0, smin=0.0, smax=9.0, bp=225.0, cw=(0.4, 0.6) (PSNR=42.55)
+- BSDS500: sigmaColor=350, sigmaSpace=125, high_thresh=120, low_thresh=60, smin=0, smax=5.5, bp=320.0, cw=(0.4, 0.6) (PSNR=29.68, SSIM=0.878, bpp=6.673)
+- SVG: sigmaColor=85, sigmaSpace=140, high_thresh=20, low_thresh=0, smin=0, smax=15, bp=205.0, cw=(0.4, 0.6) (PSNR=28.89, SSIM=0.9329, bpp=1.191)
 
 ## Technical Progression Summary
 
