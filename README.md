@@ -5,11 +5,14 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 
 ## Repository Layout
 
-- `v1.0funcCompress.ipynb` to `v6.0FuncCompress.ipynb`: main versioned notebooks.
-- `pics/`: input images used for testing.
-- `Results/`: reconstructed output examples.
-- `imComp.txt`: serialized geometry/color output used for debugging and reconstruction.
-- `test.jpg`, `test.png`, `test.tiff`: small test assets.
+- `v1.0funcCompress.ipynb` to `v7.3FuncCompress.ipynb`: main versioned notebooks.
+- `v7.4funcCompress.py` to `v7.5FuncCompress.py`: Final parameter tuning, validation, and testing
+- `kodak/`: input images used for final testing.
+- `BSDS500/`: BSDS500 dataset used for natural image parameter tuning and validation. It is not sent to github for space constraints
+- `svgs/`: SVG dataset used for structured image parameter tuning, validation, and testing.
+- `tuned_config.json`: frozen hyperparameters selected by grid search, written after tuning and read by v7.5 for all final numbers.
+- `requirements.txt`: required packages.
+- `.gitignore`: gitignore file.
 
 ## Version Evolution
 
@@ -121,16 +124,21 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 ### v7.3 Copied v5.1 and updated to match v7.1 advances and following changes
 - **Current file:** `v7.3FuncCompress.ipynb`
 - Verify matched parameter budgets for B-spline vs. Bezier comparison
+- Added the original polynomial fitting method as a fourth boundary baseline alongside B-spline, Bezier, and Chebyshev
 
 ### v7.4 Held out set for hyperparameter tuning and validation
-- **Current file:** `v7.4FuncCompress.ipynb`
+- **Current file:** `v7.4FuncCompress.py`
 - Put everything inside functions and iterating through hyperparameter options
+- Chosen parameters output to tuned_config.json which is read in by v7.5
 - BSDS500: sigmaColor=350, sigmaSpace=125, high_thresh=120, low_thresh=60, smin=0, smax=5.5, bp=320.0, cw=(0.4, 0.6) (PSNR=29.68, SSIM=0.878, bpp=6.673)
 - SVG: sigmaColor=85, sigmaSpace=140, high_thresh=20, low_thresh=0, smin=0, smax=15, bp=205.0, cw=(0.4, 0.6) (PSNR=28.89, SSIM=0.9329, bpp=1.191)
 
 ### v7.5 Final testing numbers
-- **Current file:** `v7.5FuncCompress.ipynb`
+- **Current file:** `v7.5FuncCompress.py`
+- Consolidates v7.2 (error decomposition), v7.3 (boundary comparison), and v7.4 (codec + hyperparameter tuning) into a single evaluation harness
 - Report final figures and numbers with all contributions in one file
+- All figures and tables saved to files to upload to LaTeX
+- v7.2/v7.3 ablation studies now run across full held-out test sets per category instead of a single image
 
 ## Technical Progression Summary
 
@@ -142,15 +150,17 @@ The project evolved from a polynomial-boundary prototype into a more robust cont
 
 ## Serialization Notes
 
+Note: this describes the plain-text `imComp.txt` format used internally by the v7.2/v7.3 ablation studies for boundary/interior comparisons. The final codec (v7.5) serializes to a separate binary format, documented in the paper.
+
 imComp.txt record format (per region)
 
 C;L,a,b;
 
 Mean region color in LAB (integer values).
-M;a0,a1,a2;b0,b1,b2;c0,c1,c2;
+M;xc,yc;a0,a1,a2;b0,b1,b2;c0,c1,c2;
 
-Planar LAB model coefficients, one triple per channel.
-Model: value(x,y) = a + b*x + c*y.
+Region centroid (xc, yc) followed by planar LAB model coefficients, one triple per channel.
+Model: value(x,y) = a + b*(x - xc) + c*(y - yc).
 S;k;knots;ctrl_row;ctrl_col;
 
 Spline boundary record.

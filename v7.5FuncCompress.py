@@ -61,7 +61,7 @@ def encode_for_decomposition(img_lab, imgClusters, edgesSorted, clustMeans, path
                 m0 = ",".join(f"{v:.6f}" for v in coef[0])
                 m1 = ",".join(f"{v:.6f}" for v in coef[1])
                 m2 = ",".join(f"{v:.6f}" for v in coef[2])
-                f.write(f"C;{col[0]},{col[1]},{col[2]};\n")
+                f.write(f"C;{int(round(col[0]))},{int(round(col[1]))},{int(round(col[2]))};\n")
                 f.write(f"M;{xc:.4f},{yc:.4f};{m0};{m1};{m2};\n")
                 for line in geom_lines:
                     f.write(line + "\n")
@@ -69,45 +69,48 @@ def encode_for_decomposition(img_lab, imgClusters, edgesSorted, clustMeans, path
 
 def run_decomposition(image_path, config):
     comp_path = f"imComp_{os.getpid()}.txt"
-    chosenImage = cv2.imread(image_path)
-    complexity_score, _ = local_lab_complexity_score(chosenImage, window_size=7)
-    thresh = adaptive_deltaE_threshold(complexity_score, low_complexity=2.0, high_complexity=12.0,
-                                        high_thresh=config['high_thresh'], low_thresh=config['low_thresh'])
-    filtered = cv2.bilateralFilter(chosenImage, d=7, sigmaColor=config['sigmaColor'], sigmaSpace=config['sigmaSpace'])
-    imgClusters, edgesSorted = run_segmentation(filtered, thresh)
-    img_lab = cv2.cvtColor(filtered, cv2.COLOR_BGR2LAB).astype(float)
+    try:
+        chosenImage = cv2.imread(image_path)
+        complexity_score, _ = local_lab_complexity_score(chosenImage, window_size=7)
+        thresh = adaptive_deltaE_threshold(complexity_score, low_complexity=2.0, high_complexity=12.0,
+                                            high_thresh=config['high_thresh'], low_thresh=config['low_thresh'])
+        filtered = cv2.bilateralFilter(chosenImage, d=7, sigmaColor=config['sigmaColor'], sigmaSpace=config['sigmaSpace'])
+        imgClusters, edgesSorted = run_segmentation(filtered, thresh)
+        img_lab = cv2.cvtColor(filtered, cv2.COLOR_BGR2LAB).astype(float)
 
-    clustMeans = []
-    for i in range(len(edgesSorted)):
-        region_mask = (imgClusters == i + 1)
-        clustMeans.append(img_lab[region_mask].mean(axis=0) if region_mask.sum() > 0 else np.zeros(3))
+        clustMeans = []
+        for i in range(len(edgesSorted)):
+            region_mask = (imgClusters == i + 1)
+            clustMeans.append(img_lab[region_mask].mean(axis=0) if region_mask.sum() > 0 else np.zeros(3))
 
-    encode_for_decomposition(img_lab, imgClusters, edgesSorted, clustMeans, comp_path)
+        encode_for_decomposition(img_lab, imgClusters, edgesSorted, clustMeans, comp_path)
 
-    orig_rgb = cv2.cvtColor(chosenImage, cv2.COLOR_BGR2RGB)
-    orig_lab = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2LAB)
+        orig_rgb = cv2.cvtColor(chosenImage, cv2.COLOR_BGR2RGB)
+        orig_lab = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2LAB)
 
-    A_rgb = cv2.cvtColor(recon_exact_mean(orig_lab, imgClusters, clustMeans), cv2.COLOR_LAB2RGB)
-    B_rgb = cv2.cvtColor(recon_spline_mean_from_file(comp_path, imgClusters.shape), cv2.COLOR_LAB2RGB)
-    C_rgb = cv2.cvtColor(recon_exact_original(orig_lab, imgClusters), cv2.COLOR_LAB2RGB)
-    D_rgb = cv2.cvtColor(recon_exact_planar(orig_lab, imgClusters), cv2.COLOR_LAB2RGB)
-    E_rgb = cv2.cvtColor(recon_spline_planar_actual(comp_path, imgClusters.shape), cv2.COLOR_LAB2RGB)
-    F_rgb = cv2.cvtColor(recon_spline_original_from_file(comp_path, imgClusters.shape, orig_lab), cv2.COLOR_LAB2RGB)
+        A_rgb = cv2.cvtColor(recon_exact_mean(orig_lab, imgClusters, clustMeans), cv2.COLOR_LAB2RGB)
+        B_rgb = cv2.cvtColor(recon_spline_mean_from_file(comp_path, imgClusters.shape), cv2.COLOR_LAB2RGB)
+        C_rgb = cv2.cvtColor(recon_exact_original(orig_lab, imgClusters), cv2.COLOR_LAB2RGB)
+        D_rgb = cv2.cvtColor(recon_exact_planar(orig_lab, imgClusters), cv2.COLOR_LAB2RGB)
+        E_rgb = cv2.cvtColor(recon_spline_planar_actual(comp_path, imgClusters.shape), cv2.COLOR_LAB2RGB)
+        F_rgb = cv2.cvtColor(recon_spline_original_from_file(comp_path, imgClusters.shape, orig_lab), cv2.COLOR_LAB2RGB)
 
-    band_mask, interior_mask = boundary_band_from_labels(imgClusters, radius=2)
+        band_mask, interior_mask = boundary_band_from_labels(imgClusters, radius=2)
 
-    dC = report("C exact+original", C_rgb, orig_rgb, band_mask, interior_mask)
-    dD = report("D exact+planar", D_rgb, orig_rgb, band_mask, interior_mask)
-    dE = report("E spline+planar", E_rgb, orig_rgb, band_mask, interior_mask)
-    dF = report("F spline+original", F_rgb, orig_rgb, band_mask, interior_mask)
+        dC = report("C exact+original", C_rgb, orig_rgb, band_mask, interior_mask)
+        dD = report("D exact+planar", D_rgb, orig_rgb, band_mask, interior_mask)
+        dE = report("E spline+planar", E_rgb, orig_rgb, band_mask, interior_mask)
+        dF = report("F spline+original", F_rgb, orig_rgb, band_mask, interior_mask)
 
-    dseg = dC
-    dbnd = dF - dC
-    dapp = dD - dC
-    dpred = dseg + dbnd + dapp
-    dint = dE - dpred
-    os.remove(comp_path)
-    return {'dseg': dseg, 'dbnd': dbnd, 'dapp': dapp, 'dint': dint, 'dE': dE}
+        dseg = dC
+        dbnd = dF - dC
+        dapp = dD - dC
+        dpred = dseg + dbnd + dapp
+        dint = dE - dpred
+        return {'dseg': dseg, 'dbnd': dbnd, 'dapp': dapp, 'dint': dint, 'dE': dE}
+    finally:
+        if os.path.exists(comp_path):
+            os.remove(comp_path)
 
 # Spline reconstruction using planar model fill for each cluster
 def recon_spline_planar_actual(imComp_path, img_shape_hw):
@@ -492,68 +495,72 @@ def aggregate_decomposition(images, config, label):
 ########### v7.3 boundary encoding study #############
 def run_boundary_comparison(image_path, config):
     comp_path = f"imComp_{os.getpid()}.txt"
-    chosenImage = cv2.imread(image_path)
-    complexity_score, _ = local_lab_complexity_score(chosenImage, window_size=7)
-    thresh = adaptive_deltaE_threshold(complexity_score, low_complexity=2.0, high_complexity=12.0,
-                                        high_thresh=config['high_thresh'], low_thresh=config['low_thresh'])
-    filtered = cv2.bilateralFilter(chosenImage, d=7, sigmaColor=config['sigmaColor'], sigmaSpace=config['sigmaSpace'])
-    imgClusters, edgesSorted = run_segmentation(filtered, thresh)
-    img = cv2.cvtColor(filtered, cv2.COLOR_BGR2LAB).astype(float)
-    H, W = img.shape[:2]
-    min_area = 50.0
+    try:
+        chosenImage = cv2.imread(image_path)
+        complexity_score, _ = local_lab_complexity_score(chosenImage, window_size=7)
+        thresh = adaptive_deltaE_threshold(complexity_score, low_complexity=2.0, high_complexity=12.0,
+                                            high_thresh=config['high_thresh'], low_thresh=config['low_thresh'])
+        filtered = cv2.bilateralFilter(chosenImage, d=7, sigmaColor=config['sigmaColor'], sigmaSpace=config['sigmaSpace'])
+        imgClusters, edgesSorted = run_segmentation(filtered, thresh)
+        img = cv2.cvtColor(filtered, cv2.COLOR_BGR2LAB).astype(float)
+        H, W = img.shape[:2]
+        min_area = 50.0
 
-    orig_rgb = cv2.cvtColor(chosenImage, cv2.COLOR_BGR2RGB)
-    band_mask, interior_mask = boundary_band_from_labels(imgClusters, radius=2)
+        orig_rgb = cv2.cvtColor(chosenImage, cv2.COLOR_BGR2RGB)
+        band_mask, interior_mask = boundary_band_from_labels(imgClusters, radius=2)
 
-    budgets = [8, 12, 16, 20, 24]
-    byte_budgets = [120, 160, 200, 250, 300, 400]
-    methods = {'B-spline': bspline_at_n, 'Bezier': bezier_at_n, 'Chebyshev': chebyshev_at_n, 'Polynomial': poly_at_n}
+        budgets = [8, 12, 16, 20, 24]
+        byte_budgets = [120, 160, 200, 250, 300, 400]
+        methods = {'B-spline': bspline_at_n, 'Bezier': bezier_at_n, 'Chebyshev': chebyshev_at_n, 'Polynomial': poly_at_n}
 
-    result = {'param_matched': {m: {n: {} for n in budgets} for m in methods},
-              'byte_matched': {m: {B: {} for B in byte_budgets} for m in methods}}
+        result = {'param_matched': {m: {n: {} for n in budgets} for m in methods},
+                'byte_matched': {m: {B: {} for B in byte_budgets} for m in methods}}
 
-    iou_scores = {m: {n: [] for n in budgets} for m in methods}
-    chamfer_scores = {m: {n: [] for n in budgets} for m in methods}
-    for x_list, y_list in edgesSorted:
-        contour = enforce_closed_contour_rc(x_list, y_list)
-        if len(contour) < 8 or contour_area_rc(contour) < min_area or (len(contour) - 1) < max(budgets):
-            continue
-        cache, ok = {}, True
-        for n in budgets:
-            for name, fn in methods.items():
-                pts = fn(contour, n, H, W)
-                if pts is None or len(pts) < 3:
-                    ok = False
-                cache[(n, name)] = pts
-        if ok:
+        iou_scores = {m: {n: [] for n in budgets} for m in methods}
+        chamfer_scores = {m: {n: [] for n in budgets} for m in methods}
+        for x_list, y_list in edgesSorted:
+            contour = enforce_closed_contour_rc(x_list, y_list)
+            if len(contour) < 8 or contour_area_rc(contour) < min_area or (len(contour) - 1) < max(budgets):
+                continue
+            cache, ok = {}, True
             for n in budgets:
-                for name in methods:
-                    iou_scores[name][n].append(contour_iou(H, W, cache[(n, name)], contour))
-                    chamfer_scores[name][n].append(symmetric_chamfer(cache[(n, name)], contour))
+                for name, fn in methods.items():
+                    pts = fn(contour, n, H, W)
+                    if pts is None or len(pts) < 3:
+                        ok = False
+                    cache[(n, name)] = pts
+            if ok:
+                for n in budgets:
+                    for name in methods:
+                        iou_scores[name][n].append(contour_iou(H, W, cache[(n, name)], contour))
+                        chamfer_scores[name][n].append(symmetric_chamfer(cache[(n, name)], contour))
 
-    for m in methods:
-        for n in budgets:
-            result['param_matched'][m][n]['iou'] = float(np.mean(iou_scores[m][n])) if iou_scores[m][n] else np.nan
-            result['param_matched'][m][n]['chamfer'] = float(np.mean(chamfer_scores[m][n])) if chamfer_scores[m][n] else np.nan
+        for m in methods:
+            for n in budgets:
+                result['param_matched'][m][n]['iou'] = float(np.mean(iou_scores[m][n])) if iou_scores[m][n] else np.nan
+                result['param_matched'][m][n]['chamfer'] = float(np.mean(chamfer_scores[m][n])) if chamfer_scores[m][n] else np.nan
 
-    for m, fn in methods.items():
-        for n in budgets:
-            rec_rgb = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
-            result['param_matched'][m][n]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
-            result['param_matched'][m][n]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
-            result['param_matched'][m][n]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
-
-    n_at = {B: {m: max_n_for_bytes(m, B) for m in methods} for B in byte_budgets}
-    for B in byte_budgets:
         for m, fn in methods.items():
-            n = n_at[B][m]
-            rec_rgb = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
-            result['byte_matched'][m][B]['n'] = n
-            result['byte_matched'][m][B]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
-            result['byte_matched'][m][B]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
-            result['byte_matched'][m][B]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
-    os.remove(comp_path)
-    return result
+            for n in budgets:
+                rec_rgb = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
+                result['param_matched'][m][n]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
+                result['param_matched'][m][n]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
+                result['param_matched'][m][n]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
+
+        n_at = {B: {m: max_n_for_bytes(m, B) for m in methods} for B in byte_budgets}
+        for B in byte_budgets:
+            for m, fn in methods.items():
+                n = n_at[B][m]
+                rec_rgb = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
+                result['byte_matched'][m][B]['n'] = n
+                result['byte_matched'][m][B]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
+                result['byte_matched'][m][B]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
+                result['byte_matched'][m][B]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
+        return result
+    finally:
+        if os.path.exists(comp_path):
+            os.remove(comp_path)
+
 
 def compress_fixed_n(fit_fn, n, img, imgClusters, edgesSorted, min_area, path):
     with open(path, 'w') as f:
@@ -2561,12 +2568,13 @@ def write_final_report(decomp_natural, decomp_structured, bnd_natural, bnd_struc
 # Hyperparameter Tuning
 
 # %%
+with warnings.catch_warnings():
+    warnings.simplefilter('ignore', np.exceptions.RankWarning)
+    warnings.simplefilter('ignore', UserWarning)
+    lpips_fn = lpips.LPIPS(net='alex', verbose=False)
+
 if __name__ == '__main__':
     warnings.filterwarnings("ignore")
-    # Initialize LPIPS
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', np.exceptions.RankWarning)
-        lpips_fn = lpips.LPIPS(net='alex', verbose=False)
 
     # Load all images
     tune_images, stability_images = load_disjoint_splits('BSDS500/val', [15, 30], seed=42)
