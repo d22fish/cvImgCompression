@@ -2,6 +2,8 @@
 import numpy as np
 import cv2
 import os
+import matplotlib
+matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 import sys
 from scipy.ndimage import label, uniform_filter, binary_dilation, convolve, distance_transform_edt
@@ -542,20 +544,24 @@ def run_boundary_comparison(image_path, config):
 
         for m, fn in methods.items():
             for n in budgets:
-                rec_rgb = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
+                rec_rgb, fail_n, total_n = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
                 result['param_matched'][m][n]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
                 result['param_matched'][m][n]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
                 result['param_matched'][m][n]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
+                result['param_matched'][m][n]['fail_count'] = fail_n
+                result['param_matched'][m][n]['total_count'] = total_n
 
         n_at = {B: {m: max_n_for_bytes(m, B) for m in methods} for B in byte_budgets}
         for B in byte_budgets:
             for m, fn in methods.items():
                 n = n_at[B][m]
-                rec_rgb = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
+                rec_rgb, fail_B, total_B = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
                 result['byte_matched'][m][B]['n'] = n
                 result['byte_matched'][m][B]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
                 result['byte_matched'][m][B]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
                 result['byte_matched'][m][B]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
+                result['byte_matched'][m][B]['fail_count'] = fail_B
+                result['byte_matched'][m][B]['total_count'] = total_B
         return result
     finally:
         if os.path.exists(comp_path):
@@ -563,11 +569,14 @@ def run_boundary_comparison(image_path, config):
 
 
 def compress_fixed_n(fit_fn, n, img, imgClusters, edgesSorted, min_area, path):
+    fail_count = 0
+    total_count = 0
     with open(path, 'w') as f:
         for i, (x_list, y_list) in enumerate(edgesSorted):
             contour = enforce_closed_contour_rc(x_list, y_list)
             if len(contour) < 3:
                 continue
+            total_count += 1
             cluster_id = i + 1
             region_mask = (imgClusters == cluster_id)
             coef, xc, yc = fit_region_planar_model(img, region_mask)
@@ -580,10 +589,12 @@ def compress_fixed_n(fit_fn, n, img, imgClusters, edgesSorted, min_area, path):
                 pts = fit_fn(contour, n, img.shape[0], img.shape[1])
             if pts is None or len(pts) < 3:
                 pts = subsample_to_n(contour, n)
+                fail_count += 1
             payload = ';'.join(f'{float(r):.4f},{float(c):.4f}' for r, c in pts)
             f.write(f'L;{payload};\n\n')
     rec_lab = decode_planar_any_geometry(path, img.shape[:2])
-    return cv2.cvtColor(rec_lab, cv2.COLOR_LAB2RGB)
+    rec_rgb = cv2.cvtColor(rec_lab, cv2.COLOR_LAB2RGB)
+    return rec_rgb, fail_count, total_count
 
 def geom_bytes(method, n, k=3):
     if method == 'B-spline':
@@ -975,12 +986,18 @@ def aggregate_boundary_comparison(images, config, label):
     for m in methods:
         for n in budgets:
             for metric in results[0]['param_matched'][m][n]:
-                avg['param_matched'][m][n][metric] = float(np.nanmean([r['param_matched'][m][n][metric] for r in results]))
+                if metric in ('fail_count', 'total_count'):
+                    avg['param_matched'][m][n][metric] = sum(r['param_matched'][m][n][metric] for r in results)
+                else:
+                    avg['param_matched'][m][n][metric] = float(np.nanmean([r['param_matched'][m][n][metric] for r in results]))
         for B in byte_budgets:
             for metric in results[0]['byte_matched'][m][B]:
-                avg['byte_matched'][m][B][metric] = float(np.nanmean([r['byte_matched'][m][B][metric] for r in results]))
+                if metric in ('fail_count', 'total_count'):
+                    avg['byte_matched'][m][B][metric] = sum(r['byte_matched'][m][B][metric] for r in results)
+                else:
+                    avg['byte_matched'][m][B][metric] = float(np.nanmean([r['byte_matched'][m][B][metric] for r in results]))
 
-    print(f"\n{label} boundary comparison (n={len(images)}):")
+    print(f"\n{label} boundary comparison (n={len(images)}): {avg}")
     return avg
 
 ########### v7.3 boundary encoding study #############
@@ -2377,6 +2394,7 @@ def encode_raster_baseline(images, codec, qualities):
             scores.append({
                 'psnr': masked_psnr(orig_rgb, rec_rgb, full),
                 'ssim': masked_ssim(orig_rgb, rec_rgb, full),
+                'lpips': compute_lpips(orig_rgb, rec_rgb),
                 'bpp':  len(buf) * 8 / (H * W),
             })
         results.append({
@@ -2384,6 +2402,7 @@ def encode_raster_baseline(images, codec, qualities):
             'bpp':  np.mean([s['bpp']  for s in scores]),
             'psnr': np.mean([s['psnr'] for s in scores]),
             'ssim': np.mean([s['ssim'] for s in scores]),
+            'lpips': np.mean([s['lpips'] for s in scores]),
         })
     return results
 
@@ -2450,9 +2469,10 @@ def plot_boundary_fig1(avg, savepath=None):
     budgets = sorted(avg['param_matched'][next(iter(avg['param_matched']))].keys())
     byte_budgets = sorted(avg['byte_matched'][next(iter(avg['byte_matched']))].keys())
     colors = {'B-spline': 'steelblue', 'Bezier': 'darkorange', 'Chebyshev': 'forestgreen', 'Polynomial': 'crimson'}
+    plot_methods = [m for m in avg['param_matched'] if m != 'Polynomial']
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    for m in avg['param_matched']:
+    for m in plot_methods:
         psnr_by_n = [avg['param_matched'][m][n]['psnr'] for n in budgets]
         ax1.plot(budgets, psnr_by_n, marker='o', label=m, color=colors[m], linewidth=2)
 
@@ -2497,17 +2517,11 @@ def plot_timing(results, savepath=None):
     if savepath:
         plt.savefig(savepath, format='svg', bbox_inches='tight')
 
-def write_final_report(decomp_natural, decomp_structured, bnd_natural, bnd_structured,
-                        mode_natural, mode_structured, diag_natural, diag_structured,
-                        filepath='final_results.txt'):
-    with open(filepath, 'w') as f:
-        f.write("=" * 70 + "\nTABLE V - Error decomposition\n" + "=" * 70 + "\n")
-        for label, d in [('Natural', decomp_natural), ('Structured', decomp_structured)]:
-            f.write(f"\n{label}:\n")
-            for k, v in d.items():
-                f.write(f"  {k:8s} = {v:.4f}\n")
+def write_boundary_report(bnd_natural, bnd_structured, table_dir='paper_tables'):
+    os.makedirs(table_dir, exist_ok=True)
 
-        f.write("\n" + "=" * 70 + "\nTABLE VI - Matched parameter budget\n" + "=" * 70 + "\n")
+    with open(os.path.join(table_dir, 'table_vi.txt'), 'w') as f:
+        f.write("TABLE VI - Matched parameter budget\n")
         for label, d in [('Natural', bnd_natural), ('Structured', bnd_structured)]:
             f.write(f"\n{label}:\n")
             methods = list(d['param_matched'].keys())
@@ -2521,7 +2535,8 @@ def write_final_report(decomp_natural, decomp_structured, bnd_natural, bnd_struc
                         row += f"{d['param_matched'][m][n][metric]:>14.4f}"
                     f.write(row + "\n")
 
-        f.write("\n" + "=" * 70 + "\nTABLE VII - Matched byte budget\n" + "=" * 70 + "\n")
+    with open(os.path.join(table_dir, 'table_vii.txt'), 'w') as f:
+        f.write("TABLE VII - Matched byte budget\n")
         for label, d in [('Natural', bnd_natural), ('Structured', bnd_structured)]:
             f.write(f"\n{label}:\n")
             methods = list(d['byte_matched'].keys())
@@ -2532,11 +2547,47 @@ def write_final_report(decomp_natural, decomp_structured, bnd_natural, bnd_struc
                 for B in byte_budgets:
                     row = f"  {B:>8}"
                     for m in methods:
-                        val = d['byte_matched'][m][B][metric]
-                        row += f"{val:>14.4f}" if metric != 'n' else f"{val:>14d}"
+                        row += f"{d['byte_matched'][m][B][metric]:>14.1f}"
                     f.write(row + "\n")
 
-        f.write("\n" + "=" * 70 + "\nTABLE IX - Mode allocation\n" + "=" * 70 + "\n")
+    with open(os.path.join(table_dir, 'table_viii.txt'), 'w') as f:
+        f.write("TABLE VIII - Fit failure rates\n")
+        for label, d in [('Natural', bnd_natural), ('Structured', bnd_structured)]:
+            f.write(f"\n{label}:\n")
+            methods = list(d['param_matched'].keys())
+            budgets = sorted(d['param_matched'][methods[0]].keys())
+            byte_budgets = sorted(d['byte_matched'][methods[0]].keys())
+            f.write("\n  Parameter-matched (fail/total)\n")
+            f.write(f"  {'N':>6}" + "".join(f"{m:>14}" for m in methods) + "\n")
+            for n in budgets:
+                row = f"  {n:>6}"
+                for m in methods:
+                    fail = d['param_matched'][m][n]['fail_count']
+                    total = d['param_matched'][m][n]['total_count']
+                    row += f"{fail:>7}/{total:<6}"
+                f.write(row + "\n")
+            f.write("\n  Byte-matched (fail/total)\n")
+            f.write(f"  {'Budget':>8}" + "".join(f"{m:>14}" for m in methods) + "\n")
+            for B in byte_budgets:
+                row = f"  {B:>8}"
+                for m in methods:
+                    fail = d['byte_matched'][m][B]['fail_count']
+                    total = d['byte_matched'][m][B]['total_count']
+                    row += f"{fail:>7}/{total:<6}"
+                f.write(row + "\n")
+def write_decomposition_report(decomp_natural, decomp_structured, table_dir='paper_tables'):
+    os.makedirs(table_dir, exist_ok=True)
+    with open(os.path.join(table_dir, 'table_v.txt'), 'w') as f:
+        f.write("TABLE V - Error decomposition\n")
+        for label, d in [('Natural', decomp_natural), ('Structured', decomp_structured)]:
+            f.write(f"\n{label}:\n")
+            for k, v in d.items():
+                f.write(f"  {k:8s} = {v:.4f}\n")
+
+def write_mode_report(mode_natural, mode_structured, table_dir='paper_tables'):
+    os.makedirs(table_dir, exist_ok=True)
+    with open(os.path.join(table_dir, 'table_ix.txt'), 'w') as f:
+        f.write("TABLE IX - Mode allocation\n")
         for label, totals in [('Natural', mode_natural), ('Structured', mode_structured)]:
             f.write(f"\n{label}:\n")
             total_regions = sum(totals[m]['regions'] for m in totals)
@@ -2551,7 +2602,10 @@ def write_final_report(decomp_natural, decomp_structured, bnd_natural, bnd_struc
                 avg_bytes = totals[m]['bytes'] / max(totals[m]['regions'], 1)
                 f.write(f"  {m:<10} {pct_r:>9.1f}% {pct_p:>9.1f}% {pct_b:>9.1f}% {avg_ctrl:>8.1f} {avg_bytes:>10.1f}\n")
 
-        f.write("\n" + "=" * 70 + "\nTABLE X - Reconstruction diagnostics\n" + "=" * 70 + "\n")
+def write_diagnostics_report(diag_natural, diag_structured, table_dir='paper_tables'):
+    os.makedirs(table_dir, exist_ok=True)
+    with open(os.path.join(table_dir, 'table_x.txt'), 'w') as f:
+        f.write("TABLE X - Reconstruction diagnostics\n")
         for label, d in [('Natural', diag_natural), ('Structured', diag_structured)]:
             f.write(f"\n{label}:\n")
             f.write(f"  Region count: initial={d['initial']} encoded={d['encoded']}\n")
@@ -2559,8 +2613,6 @@ def write_final_report(decomp_natural, decomp_structured, bnd_natural, bnd_struc
             f.write(f"  Coverage repair: raster={100*d['cov_raster']:.2f}% "
                     f"dilation/convolution={100*d['cov_repair']:.2f}% "
                     f"nearest={100*d['cov_nearest']:.2f}%\n")
-
-    print(f"\nFinal results written to {filepath}")
 
 ########### Plotting and outputs ###########s
 
@@ -2573,8 +2625,9 @@ with warnings.catch_warnings():
     warnings.simplefilter('ignore', UserWarning)
     lpips_fn = lpips.LPIPS(net='alex', verbose=False)
 
+warnings.filterwarnings("ignore")
+
 if __name__ == '__main__':
-    warnings.filterwarnings("ignore")
 
     # Load all images
     tune_images, stability_images = load_disjoint_splits('BSDS500/val', [15, 30], seed=42)
@@ -2590,6 +2643,9 @@ if __name__ == '__main__':
     os.makedirs(FIGURE_DIR, exist_ok=True)
     plt.rcParams.update({'font.size': 11, 'axes.titlesize': 12, 'figure.dpi': 150})
 
+    run_start = time.time()
+    print(f"Run started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
     # ===== Run final end-to-end pipeline ===== 
     print("\nBSDS final:")
     run_final_test(kodak_images, config_bsds)
@@ -2599,13 +2655,15 @@ if __name__ == '__main__':
     # ===== v7.2 Testing ===== 
     decomp_natural = aggregate_decomposition(kodak_images, config_bsds, 'Natural')
     decomp_structured = aggregate_decomposition(test_svgs, config_svg, 'Structured')
+    write_decomposition_report(decomp_natural, decomp_structured)
 
     # ===== v7.3 Testing ===== 
     bnd_natural = aggregate_boundary_comparison(kodak_images, config_bsds, 'Natural')
     bnd_structured = aggregate_boundary_comparison(test_svgs, config_svg, 'Structured')
     plot_boundary_fig1(bnd_natural, savepath='paper_figures/fig1_boundary_natural.svg')
     plot_boundary_fig1(bnd_structured, savepath='paper_figures/fig1_boundary_structured.svg')
-
+    write_boundary_report(bnd_natural, bnd_structured)
+    
     # ===== v7.4 Testing ===== 
     # R-D sweep — sweep lambda with fixed dct_quality; adjust ranges after lambda calibration
     lp_fn = lpips.LPIPS(net='alex', verbose=False)
@@ -2650,10 +2708,12 @@ if __name__ == '__main__':
     # Table IX
     mode_natural = report_mode_allocation(kodak_images, config_bsds, rd_lambda=100, label='Natural')
     mode_structured = report_mode_allocation(test_svgs, config_svg, rd_lambda=100, label='Structured')
+    write_mode_report(mode_natural, mode_structured)
     
     # Table X
     diag_natural = report_diagnostics(kodak_images, config_bsds, rd_lambda=100, label='Natural')
     diag_structured = report_diagnostics(test_svgs, config_svg, rd_lambda=100, label='Structured')
+    write_diagnostics_report(diag_natural, diag_structured)
     
     # Timing experiment for Fig 4
     timing_images = kodak_images[:6]
@@ -2665,6 +2725,7 @@ if __name__ == '__main__':
     timing_structured = run_timing_experiment(test_svgs[:6], scales, config_svg)
     plot_timing(timing_structured, savepath='paper_figures/fig4_timing_structured.svg')
 
-    # Write results to file
-    write_final_report(decomp_natural, decomp_structured, bnd_natural, bnd_structured,
-                        mode_natural, mode_structured, diag_natural, diag_structured)
+    elapsed = time.time() - run_start
+    h, rem = divmod(elapsed, 3600)
+    m, s = divmod(rem, 60)
+    print(f"Run finished at {time.strftime('%Y-%m-%d %H:%M:%S')} - total elapsed: {int(h)}h {int(m)}m {int(s)}s")
