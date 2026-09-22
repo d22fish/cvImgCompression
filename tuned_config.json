@@ -1,28 +1,30 @@
 {
   "natural": {
-    "sigmaColor": 350,
-    "sigmaSpace": 125,
-    "high_thresh": 120.0,
-    "low_thresh": 60.0,
+    "sigmaColor": 200,
+    "sigmaSpace": 20,
+    "high_thresh": 130,
+    "low_thresh": 0.3,
     "spline_min_smooth": 0.0,
-    "spline_max_smooth": 5.5,
-    "spline_base_perim": 320.0,
+    "spline_max_smooth": 10.5,
+    "spline_base_perim": 200,
     "complexity_weights": [
-      0.4,
-      0.6
-    ]
+      0.3,
+      0.7
+    ],
+    "rd_lambda": 100
   },
   "structured": {
-    "sigmaColor": 85,
-    "sigmaSpace": 140,
-    "high_thresh": 20.0,
+    "sigmaColor": 50,
+    "sigmaSpace": 80,
+    "high_thresh": 20,
     "low_thresh": 0.0,
-    "spline_min_smooth": 0.0,
-    "spline_max_smooth": 15.0,
-    "spline_base_perim": 205.0,
+    "spline_min_smooth": 2,
+    "spline_max_smooth": 18.0,
+    "spline_base_perim": 260,
     "complexity_weights": [
       0.4,
       0.6
-    ]
+    ],
+    "rd_lambda": 100
   }
 }

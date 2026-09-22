@@ -1,0 +1,12 @@
+paper_figures_pdf/fig1_boundary_natural.pdf
+paper_figures_pdf/fig1_boundary_structured.pdf
+paper_figures_pdf/fig2_threshold_natural.pdf
+paper_figures_pdf/fig2_threshold_structured.pdf
+paper_figures_pdf/fig3_rd_natural_lpips.pdf
+paper_figures_pdf/fig3_rd_natural_psnr.pdf
+paper_figures_pdf/fig3_rd_natural_ssim.pdf
+paper_figures_pdf/fig3_rd_structured_lpips.pdf
+paper_figures_pdf/fig3_rd_structured_psnr.pdf
+paper_figures_pdf/fig3_rd_structured_ssim.pdf
+paper_figures_pdf/fig4_timing_natural.pdf
+paper_figures_pdf/fig4_timing_structured.pdf

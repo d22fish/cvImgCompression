@@ -1268,6 +1268,37 @@ def load_disjoint_splits(folder, sizes, seed=42):
         idx += size
     return splits
 
+def load_splits(path='splits.json', seed=42):
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    nat_tune, nat_val = load_disjoint_splits('BSDS500/val', [15, 15], seed=seed)
+    svg_tune, svg_val, svg_test = load_disjoint_splits('svgs', [15, 15, 24], seed=seed)
+    kodak = [os.path.join('kodak', f) for f in sorted(os.listdir('kodak'))]
+    splits = {'natural': {'tune': nat_tune, 'val': nat_val, 'test': kodak},
+              'structured': {'tune': svg_tune, 'val': svg_val, 'test': svg_test}}
+    flat = [p for cat in splits.values() for group in cat.values() for p in group]
+    assert len(flat) == len(set(flat))
+    with open(path, 'w') as f:
+        json.dump(splits, f, indent=2)
+    return splits
+
+def pareto_knee(results, x_key='bpp', y_key='psnr'):
+    frontier, best_y = [], -np.inf
+    for r in sorted(results, key=lambda r: r[x_key]):
+        if r[y_key] > best_y:
+            frontier.append(r)
+            best_y = r[y_key]
+    if len(frontier) < 3:
+        return frontier[-1]
+    xs = np.array([r[x_key] for r in frontier], dtype=float)
+    ys = np.array([r[y_key] for r in frontier], dtype=float)
+    xn = (xs - xs.min()) / max(xs.max() - xs.min(), 1e-12)
+    yn = (ys - ys.min()) / max(ys.max() - ys.min(), 1e-12)
+    slope = (yn[-1] - yn[0]) / max(xn[-1] - xn[0], 1e-12)
+    dist = yn - (yn[0] + slope * (xn - xn[0]))
+    return frontier[int(np.argmax(dist))]
+
 def tune_hyperparameters(tune_images, sc_grid, ss_grid, ht_grid, lt_grid,
                           smin_grid, smax_grid, bp_grid, cw_grid, rd_lambda=100, bpp_tol=0.05):
     results_s1 = []
@@ -1286,10 +1317,8 @@ def tune_hyperparameters(tune_images, sc_grid, ss_grid, ht_grid, lt_grid,
                     print(f"[{time.strftime('%H:%M:%S')}] sc={sc} ss={ss} ht={ht} lt={lt}: "
                           f"PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
 
-    target_bpp = min(r['bpp'] for r in results_s1)
-    best_s1 = max([r for r in results_s1 if r['bpp'] <= target_bpp * (1 + bpp_tol)],
-                  key=lambda r: r['psnr'])
-    print(f"\nBest S1: {best_s1}")
+    best_s1 = pareto_knee(results_s1)
+    print(f"\nBest S1 (Pareto knee): {best_s1}")
 
     results_s2 = []
     for smin in smin_grid:
@@ -1309,10 +1338,8 @@ def tune_hyperparameters(tune_images, sc_grid, ss_grid, ht_grid, lt_grid,
                     print(f"[{time.strftime('%H:%M:%S')}] smin={smin} smax={smax} bp={bp} cw={cw}: "
                           f"PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
 
-    target_bpp2 = min(r['bpp'] for r in results_s2)
-    best_s2 = max([r for r in results_s2 if r['bpp'] <= target_bpp2 * (1 + bpp_tol)],
-                  key=lambda r: r['psnr'])
-    print(f"\nBest S2: {best_s2}")
+    best_s2 = pareto_knee(results_s2)
+    print(f"\nBest S2 (Pareto knee): {best_s2}")
 
     config = {k: best_s1[k] for k in ['sigmaColor', 'sigmaSpace', 'high_thresh', 'low_thresh']}
     config.update({'spline_min_smooth': best_s2['smin'], 'spline_max_smooth': best_s2['smax'],
@@ -1571,9 +1598,12 @@ def _run_one(args):
 if __name__ == '__main__':
     warnings.filterwarnings("ignore")
 
-    tune_images, stability_images = load_disjoint_splits('BSDS500/val', [15, 30], seed=42)
-    val_svgs, test_svgs = load_disjoint_splits('svgs', [15, 30], seed=42)
-
+    splits = load_splits()
+    tune_images, val_images = splits['natural']['tune'], splits['natural']['val']
+    tune_svgs, val_svgs, test_svgs = splits['structured']['tune'], splits['structured']['val'], splits['structured']['test']
+    
+    # ===== STEP 1: Lambda calibration =====
+    '''
     config_bsds = {
         'sigmaColor': 350, 'sigmaSpace': 125, 'high_thresh': 120.0, 'low_thresh': 60.0,
         'spline_min_smooth': 0.0, 'spline_max_smooth': 5.5, 'spline_base_perim': 320.0,
@@ -1584,11 +1614,9 @@ if __name__ == '__main__':
         'spline_min_smooth': 0.0, 'spline_max_smooth': 15.0, 'spline_base_perim': 205.0,
         'complexity_weights': (0.40, 0.60),
     }
-    
-    # ===== STEP 1: Lambda calibration =====
-    '''
+
     calib_natural = tune_images[:5]
-    calib_structured = val_svgs[:5]
+    calib_structured = tune_svgs[:5]
 
     lam_grid = [.1, .3, .5, 1, 2, 5, 10, 20, 30, 60, 80, 100, 120, 150, 180, 200, 300, 400, 500, 550, 700, 1000]
 
@@ -1606,25 +1634,24 @@ if __name__ == '__main__':
     '''
             
     # ===== STEP 2: Hyperparameter tuning + stability testing =====
-    
-    sc_grid_bsds  = [170, 180, 190, 200, 210, 230, 250, 270, 290, 320, 350, 400, 450, 600, 900]
-    ss_grid_bsds  = [85, 105, 125, 135, 145, 155, 165]
-    ht_grid_bsds  = [24, 26, 28, 30, 32, 36, 40, 45, 50, 65, 80, 120, 200, 300, 500]
-    lt_grid_bsds  = [8.5, 9.5, 10.5, 11.5, 12.5, 14.5, 16.5, 19.5, 22.5, 30, 37.5, 45, 60, 100, 150]
-    smin_grid_bsds = [0.0, 0.25, 0.5, 1.0, 1.5, 2.0]
-    smax_grid_bsds = [3.5, 4.0, 4.5, 5.0, 5.5, 7.0, 8.5]
-    bp_grid_bsds   = [280.0, 290.0, 300.0, 310.0, 320.0, 350.0, 380.0]
-    cw_grid_bsds   = [(0.30, 0.70), (0.35, 0.65), (0.40, 0.60), (0.45, 0.55), (0.50, 0.50)]
+    sc_grid_bsds  = [120, 140, 160, 180, 200, 220, 240, 250, 270, 280, 290, 320, 350, 380, 420]
+    ss_grid_bsds  = [10, 20, 30, 45, 55, 65, 75, 85, 95, 105, 110, 125, 140, 155]
+    ht_grid_bsds  = [40, 60, 80, 100, 120, 130, 140, 150, 160, 170, 200]
+    lt_grid_bsds  = [0, 0.1, 0.3, 0.5, 1, 2, 5, 8.5, 9.5, 10, 10.5, 11.5, 12.5, 14.5, 16.5, 20, 30, 35, 50, 60]
+    smin_grid_bsds = [0.0, 0.5, 1.0]
+    smax_grid_bsds = [4.0, 5.5, 7.0, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5, 16.0]
+    bp_grid_bsds   = [200.0, 210.0, 220.0, 250.0, 270.0, 280.0, 290.0, 320.0, 360.0]
+    cw_grid_bsds   = [(0.25, 0.75), (0.30, 0.70), (0.35, 0.65), (0.40, 0.60), (0.50, 0.50)]
 
 
-    sc_grid_svg  = [65, 75, 85, 95, 105]
-    ss_grid_svg  = [100, 110, 120, 130, 140, 160, 180]
-    ht_grid_svg  = [8.0, 11.0, 14.0, 16.0, 18.0, 20.0, 22.0, 25.0, 30.0]
+    sc_grid_svg  = [50, 70, 75, 85, 95, 100, 105, 115]
+    ss_grid_svg  = [70, 80, 90, 100, 110, 115, 125, 135, 140, 145, 155, 170]
+    ht_grid_svg  = [12.0, 16.0, 18.0, 20.0, 22.0, 24.0, 28.0]
     lt_grid_svg  = [0.0, 1.0, 2.0, 3.0]
-    smin_grid_svg = [0.0, 0.5, 1.0, 1.5]
-    smax_grid_svg = [7.0, 8.0, 9.0, 10.0, 11.0, 13.0, 15.0]
-    bp_grid_svg   = [165.0, 185.0, 205.0, 215.0, 225.0, 235.0, 245.0]
-    cw_grid_svg   = [(0.30, 0.70), (0.35, 0.65), (0.40, 0.60), (0.45, 0.55), (0.50, 0.50)]
+    smin_grid_svg = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    smax_grid_svg = [11.0, 13.0, 15.0, 16.0, 17.0, 18.0, 19.0]
+    bp_grid_svg   = [185.0, 195.0, 205.0, 215.0, 220.0, 225.0, 230.0, 250.0, 260.0, 270.0, 300.0]
+    cw_grid_svg   = [(0.30, 0.70), (0.40, 0.60), (0.50, 0.50)]
     
     config_bsds, _, _ = tune_hyperparameters(
         tune_images,
@@ -1639,10 +1666,10 @@ if __name__ == '__main__':
         rd_lambda=100,
     )
     print("\nStability check (BSDS):")
-    validate_stability(stability_images, config_bsds)
+    validate_stability(val_images, config_bsds)
     
     config_svg, _, _ = tune_hyperparameters(
-        val_svgs,
+        tune_svgs,
         sc_grid=sc_grid_svg, 
         ss_grid=ss_grid_svg, 
         ht_grid=ht_grid_svg, 
@@ -1654,7 +1681,7 @@ if __name__ == '__main__':
         rd_lambda=100,
     )
     print("\nStability check (structured):")
-    validate_stability(test_svgs, config_svg)
+    validate_stability(val_svgs, config_svg)
 
     tuned_config = {
         'natural':    config_bsds,
@@ -1662,75 +1689,3 @@ if __name__ == '__main__':
     }
     with open('tuned_config.json', 'w') as f:
         json.dump(tuned_config, f, indent=2)
-    
-    '''
-    # ===== STEP 3: Final numbers =====
-    FIGURE_DIR = 'paper_figures'
-    os.makedirs(FIGURE_DIR, exist_ok=True)
-    plt.rcParams.update({'font.size': 11, 'axes.titlesize': 12, 'figure.dpi': 150})
-
-    kodak_images = [os.path.join('kodak', f) for f in sorted(os.listdir('kodak'))]
-    print("\nBSDS final:")
-    run_final_test(kodak_images, config_bsds)
-    print("\nStructured final:")
-    run_final_test(test_svgs, config_svg)
-    
-    # R-D sweep — sweep lambda with fixed dct_quality; adjust ranges after lambda calibration
-    lp_fn = lpips.LPIPS(net='alex', verbose=False)
-    lam_grid_final = [10, 30, 60, 100, 200, 400, 700, 1000]
-    dct_q_grid = [25, 35, 50]
-    
-    print("\nR-D sweep (natural):")
-    rd_natural = run_rd_sweep(kodak_images, config_bsds, lam_grid_final, dct_q_grid, lpips_fn=lp_fn)
-    print("\nR-D sweep (structured):")
-    rd_structured = run_rd_sweep(test_svgs, config_svg, lam_grid_final, dct_q_grid, lpips_fn=lp_fn)
-    
-    jpeg_q = [10, 20, 30, 50, 70, 85, 95]
-    webp_q = [10, 20, 30, 50, 70, 85, 95]
-    jpeg_natural    = encode_raster_baseline(kodak_images, 'jpeg', jpeg_q)
-    webp_natural    = encode_raster_baseline(kodak_images, 'webp', webp_q)
-    jpeg_structured = encode_raster_baseline(test_svgs,   'jpeg', jpeg_q)
-    webp_structured = encode_raster_baseline(test_svgs,   'webp', webp_q)
-    
-    print("\nR-D curves (natural):")
-    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='psnr')
-    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='ssim')
-    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='lpips')
-    
-    print("\nR-D curves (structured):")
-    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='psnr')
-    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='ssim')
-    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='lpips')
-    
-    # Threshold sweep for Fig 2 — run on stability set (disjoint from test)
-    sc_sweep_natural  = [250, 300, 350, 400, 450]
-    tau_sweep_natural = [10, 30, 60, 90, 120, 150, 180, 200, 250]
-    sc_sweep_svg  = [55, 65, 75, 85, 95, 105]
-    tau_sweep_svg = [5, 10, 14, 17, 20, 23, 25, 28, 30]
-
-    print("\nThreshold sweep (natural):")
-    thresh_grid_natural = run_threshold_sweep(stability_images[:8], sc_sweep_natural, sc_sweep_natural, config_bsds)
-    plot_threshold_sweep(thresh_grid_natural, sc_sweep_natural, sc_sweep_natural)
-
-    print("\nThreshold sweep (structured):")
-    thresh_grid_svg = run_threshold_sweep(val_svgs[:8], sc_sweep_svg, tau_sweep_svg, config_svg)
-    plot_threshold_sweep(thresh_grid_svg, sc_sweep_svg, tau_sweep_svg)
-    
-    # Table IX
-    mode_natural = report_mode_allocation(kodak_images, config_bsds, rd_lambda=100, label='Natural')
-    mode_structured = report_mode_allocation(test_svgs, config_svg, rd_lambda=100, label='Structured')
-    
-    # Table X
-    diag_natural = report_diagnostics(kodak_images, config_bsds, rd_lambda=100, label='Natural')
-    diag_structured = report_diagnostics(test_svgs, config_svg, rd_lambda=100, label='Structured')
-    
-    # Timing experiment for Fig 4
-    timing_images = kodak_images[:6]
-    scales = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
-    print("\nTiming experiment (natural):")
-    timing_natural = run_timing_experiment(timing_images, scales, config_bsds)
-    plot_timing(timing_natural)
-    print("\nTiming experiment (structured):")
-    timing_structured = run_timing_experiment(test_svgs[:6], scales, config_svg)
-    plot_timing(timing_structured)
-    '''

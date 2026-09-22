@@ -26,7 +26,6 @@ paper_tables/
 Results/
 preliminaryTestPics/
 run_output.log
-final_results.txt
 
 # Large third-party benchmark dataset
 BSDS500/

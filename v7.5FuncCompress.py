@@ -27,17 +27,22 @@ import warnings
 from concurrent.futures import ProcessPoolExecutor
 import time
 import json
+import cairosvg
+import glob
 
 # %%
 ########### v7.2 ablation study #############
-def encode_for_decomposition(img_lab, imgClusters, edgesSorted, clustMeans, path):
+def encode_for_decomposition(img_lab, imgClusters, edgesSorted, clustMeans, path,
+                             spline_min_smooth=0.0, spline_max_smooth=20.0,
+                             spline_base_perim=200.0, complexity_weights=(0.6, 0.4)):
     with open(path, "w") as f:
         for i in range(len(edgesSorted)):
             x, y = edgesSorted[i][0], edgesSorted[i][1]
             contour = enforce_closed_contour_rc(x, y)
             if len(contour) < 6 or contour_area_rc(contour) < 4.0:
                 continue
-            s_val, _ = adaptive_spline_smooth(contour, min_smooth=0.0, max_smooth=20.0, base_perimeter=200.0)
+            s_val, _ = adaptive_spline_smooth(contour, min_smooth=spline_min_smooth, max_smooth=spline_max_smooth,
+                                              base_perimeter=spline_base_perim, complexity_weights=complexity_weights)
             tck = fit_closed_bspline(contour, smooth=s_val, degree=3)
             wrote_geom = False
             geom_lines = []
@@ -78,14 +83,18 @@ def run_decomposition(image_path, config):
                                             high_thresh=config['high_thresh'], low_thresh=config['low_thresh'])
         filtered = cv2.bilateralFilter(chosenImage, d=7, sigmaColor=config['sigmaColor'], sigmaSpace=config['sigmaSpace'])
         imgClusters, edgesSorted = run_segmentation(filtered, thresh)
-        img_lab = cv2.cvtColor(filtered, cv2.COLOR_BGR2LAB).astype(float)
+        img_lab = cv2.cvtColor(chosenImage, cv2.COLOR_BGR2LAB).astype(float)
 
         clustMeans = []
         for i in range(len(edgesSorted)):
             region_mask = (imgClusters == i + 1)
             clustMeans.append(img_lab[region_mask].mean(axis=0) if region_mask.sum() > 0 else np.zeros(3))
 
-        encode_for_decomposition(img_lab, imgClusters, edgesSorted, clustMeans, comp_path)
+        encode_for_decomposition(img_lab, imgClusters, edgesSorted, clustMeans, comp_path,
+                                 spline_min_smooth=config['spline_min_smooth'],
+                                 spline_max_smooth=config['spline_max_smooth'],
+                                 spline_base_perim=config['spline_base_perim'],
+                                 complexity_weights=tuple(config['complexity_weights']))
 
         orig_rgb = cv2.cvtColor(chosenImage, cv2.COLOR_BGR2RGB)
         orig_lab = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2LAB)
@@ -99,17 +108,20 @@ def run_decomposition(image_path, config):
 
         band_mask, interior_mask = boundary_band_from_labels(imgClusters, radius=2)
 
-        dC = report("C exact+original", C_rgb, orig_rgb, band_mask, interior_mask)
-        dD = report("D exact+planar", D_rgb, orig_rgb, band_mask, interior_mask)
-        dE = report("E spline+planar", E_rgb, orig_rgb, band_mask, interior_mask)
-        dF = report("F spline+original", F_rgb, orig_rgb, band_mask, interior_mask)
+        A = report("A exact+mean", A_rgb, orig_rgb, band_mask, interior_mask)
+        B = report("B spline+mean", B_rgb, orig_rgb, band_mask, interior_mask)
+        C = report("C exact+original", C_rgb, orig_rgb, band_mask, interior_mask)
+        D = report("D exact+planar", D_rgb, orig_rgb, band_mask, interior_mask)
+        E = report("E spline+planar", E_rgb, orig_rgb, band_mask, interior_mask)
+        F = report("F spline+original", F_rgb, orig_rgb, band_mask, interior_mask)
 
-        dseg = dC
-        dbnd = dF - dC
-        dapp = dD - dC
+        dseg = C['full_mse']
+        dbnd = F['full_mse'] - C['full_mse']
+        dapp = D['full_mse'] - C['full_mse']
         dpred = dseg + dbnd + dapp
-        dint = dE - dpred
-        return {'dseg': dseg, 'dbnd': dbnd, 'dapp': dapp, 'dint': dint, 'dE': dE}
+        dint = E['full_mse'] - dpred
+        return {'conditions': {'A': A, 'B': B, 'C': C, 'D': D, 'E': E, 'F': F},
+                'dseg': dseg, 'dbnd': dbnd, 'dapp': dapp, 'dint': dint, 'dE': E['full_mse']}
     finally:
         if os.path.exists(comp_path):
             os.remove(comp_path)
@@ -483,13 +495,22 @@ def report(name, rec_rgb, orig_rgb, band_mask, interior_mask):
     print(f"  boundary  MAE={b_mae:.3f}, PSNR={b_psnr:.3f}, SSIM={b_ssim:.4f}")
     print(f"  interior  MAE={i_mae:.3f}, PSNR={i_psnr:.3f}, SSIM={i_ssim:.4f}")
 
-    return full_mse
+    return {
+        'full_mse': full_mse, 'full_psnr': full_psnr, 'full_ssim': full_ssim, 'full_lpips': full_lpips,
+        'b_mae': b_mae, 'b_psnr': b_psnr, 'b_ssim': b_ssim,
+        'i_mae': i_mae, 'i_psnr': i_psnr, 'i_ssim': i_ssim,
+    }
 
 def aggregate_decomposition(images, config, label):
     with ProcessPoolExecutor(max_workers=10) as pool:
         results = list(pool.map(_run_decomposition_one, [(p, config) for p in images]))
-    avg = {k: float(np.mean([r[k] for r in results])) for k in results[0]}
-    print(f"\n{label} (n={len(images)}): {avg}")
+    avg = {k: float(np.nanmean([r[k] for r in results])) for k in results[0] if k != 'conditions'}
+    avg['conditions'] = {
+        cond: {metric: float(np.nanmean([r['conditions'][cond][metric] for r in results]))
+               for metric in results[0]['conditions'][cond]}
+        for cond in results[0]['conditions']
+    }
+    print(f"\n{label} decomposition (n={len(images)}): {avg}")
     return avg
 
 ########### v7.2 ablation study #############
@@ -544,24 +565,47 @@ def run_boundary_comparison(image_path, config):
 
         for m, fn in methods.items():
             for n in budgets:
-                rec_rgb, fail_n, total_n = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
+                rec_rgb, fail_n, total_n, qualified_n = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
                 result['param_matched'][m][n]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
                 result['param_matched'][m][n]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
                 result['param_matched'][m][n]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
                 result['param_matched'][m][n]['fail_count'] = fail_n
                 result['param_matched'][m][n]['total_count'] = total_n
+                result['param_matched'][m][n]['qualified_count'] = qualified_n
 
         n_at = {B: {m: max_n_for_bytes(m, B) for m in methods} for B in byte_budgets}
+        iou_scores_B = {m: {B: [] for B in byte_budgets} for m in methods}
+        chamfer_scores_B = {m: {B: [] for B in byte_budgets} for m in methods}
+        max_n_needed = max(n_at[B][m] for B in byte_budgets for m in methods if n_at[B][m] is not None)
+        for x_list, y_list in edgesSorted:
+            contour = enforce_closed_contour_rc(x_list, y_list)
+            if len(contour) < 8 or contour_area_rc(contour) < min_area or (len(contour) - 1) < max_n_needed:
+                continue
+            for B in byte_budgets:
+                cache, ok = {}, True
+                for name, fn in methods.items():
+                    n = n_at[B][name]
+                    pts = fn(contour, n, H, W)
+                    if pts is None or len(pts) < 3:
+                        ok = False
+                    cache[name] = pts
+                if ok:
+                    for name in methods:
+                        iou_scores_B[name][B].append(contour_iou(H, W, cache[name], contour))
+                        chamfer_scores_B[name][B].append(symmetric_chamfer(cache[name], contour))
         for B in byte_budgets:
             for m, fn in methods.items():
                 n = n_at[B][m]
-                rec_rgb, fail_B, total_B = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
+                rec_rgb, fail_B, total_B, qualified_B = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
                 result['byte_matched'][m][B]['n'] = n
                 result['byte_matched'][m][B]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
                 result['byte_matched'][m][B]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
                 result['byte_matched'][m][B]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
                 result['byte_matched'][m][B]['fail_count'] = fail_B
                 result['byte_matched'][m][B]['total_count'] = total_B
+                result['byte_matched'][m][B]['qualified_count'] = qualified_B
+                result['byte_matched'][m][B]['iou'] = float(np.mean(iou_scores_B[m][B])) if iou_scores_B[m][B] else np.nan
+                result['byte_matched'][m][B]['chamfer'] = float(np.mean(chamfer_scores_B[m][B])) if chamfer_scores_B[m][B] else np.nan
         return result
     finally:
         if os.path.exists(comp_path):
@@ -571,6 +615,7 @@ def run_boundary_comparison(image_path, config):
 def compress_fixed_n(fit_fn, n, img, imgClusters, edgesSorted, min_area, path):
     fail_count = 0
     total_count = 0
+    qualified_count = 0
     with open(path, 'w') as f:
         for i, (x_list, y_list) in enumerate(edgesSorted):
             contour = enforce_closed_contour_rc(x_list, y_list)
@@ -585,16 +630,19 @@ def compress_fixed_n(fit_fn, n, img, imgClusters, edgesSorted, min_area, path):
             m2 = ','.join(f'{v:.6f}' for v in coef[2])
             f.write(f'M;{xc:.4f},{yc:.4f};{m0};{m1};{m2};\n')
             pts = None
+            qualifies = len(contour) >= 8 and contour_area_rc(contour) >= min_area and (len(contour) - 1) >= n
             if len(contour) >= 8 and contour_area_rc(contour) >= min_area and (len(contour) - 1) >= n:
+                qualified_count += 1
                 pts = fit_fn(contour, n, img.shape[0], img.shape[1])
             if pts is None or len(pts) < 3:
                 pts = subsample_to_n(contour, n)
-                fail_count += 1
+                if qualifies:
+                    fail_count += 1
             payload = ';'.join(f'{float(r):.4f},{float(c):.4f}' for r, c in pts)
             f.write(f'L;{payload};\n\n')
     rec_lab = decode_planar_any_geometry(path, img.shape[:2])
     rec_rgb = cv2.cvtColor(rec_lab, cv2.COLOR_LAB2RGB)
-    return rec_rgb, fail_count, total_count
+    return rec_rgb, fail_count, total_count, qualified_count
 
 def geom_bytes(method, n, k=3):
     if method == 'B-spline':
@@ -986,13 +1034,13 @@ def aggregate_boundary_comparison(images, config, label):
     for m in methods:
         for n in budgets:
             for metric in results[0]['param_matched'][m][n]:
-                if metric in ('fail_count', 'total_count'):
+                if metric in ('fail_count', 'total_count', 'qualified_count'):
                     avg['param_matched'][m][n][metric] = sum(r['param_matched'][m][n][metric] for r in results)
                 else:
                     avg['param_matched'][m][n][metric] = float(np.nanmean([r['param_matched'][m][n][metric] for r in results]))
         for B in byte_budgets:
             for metric in results[0]['byte_matched'][m][B]:
-                if metric in ('fail_count', 'total_count'):
+                if metric in ('fail_count', 'total_count', 'qualified_count'):
                     avg['byte_matched'][m][B][metric] = sum(r['byte_matched'][m][B][metric] for r in results)
                 else:
                     avg['byte_matched'][m][B][metric] = float(np.nanmean([r['byte_matched'][m][B][metric] for r in results]))
@@ -2272,6 +2320,21 @@ def load_disjoint_splits(folder, sizes, seed=42):
         idx += size
     return splits
 
+def load_splits(path='splits.json', seed=42):
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    nat_tune, nat_val = load_disjoint_splits('BSDS500/val', [15, 15], seed=seed)
+    svg_tune, svg_val, svg_test = load_disjoint_splits('svgs', [15, 15, 24], seed=seed)
+    kodak = [os.path.join('kodak', f) for f in sorted(os.listdir('kodak'))]
+    splits = {'natural': {'tune': nat_tune, 'val': nat_val, 'test': kodak},
+              'structured': {'tune': svg_tune, 'val': svg_val, 'test': svg_test}}
+    flat = [p for cat in splits.values() for group in cat.values() for p in group]
+    assert len(flat) == len(set(flat))
+    with open(path, 'w') as f:
+        json.dump(splits, f, indent=2)
+    return splits
+
 def run_final_test(test_images, config):
     with ProcessPoolExecutor(max_workers=10) as pool:
         scores = list(pool.map(_run_one, [(p, config) for p in test_images]))
@@ -2372,11 +2435,38 @@ def run_rd_sweep(images, config, lambdas, dct_qualities, lpips_fn=None):
                 'psnr':  np.mean([s['psnr']  for s in scores]),
                 'ssim':  np.mean([s['ssim']  for s in scores]),
                 'lpips': np.nanmean([s['lpips'] for s in scores]),
+                'tier_bytes': [int(sum(s['diag']['tier_byte_counts'][i] for s in scores)) for i in range(3)],
             }
             results.append(entry)
             print(f"[{time.strftime('%H:%M:%S')}] lam={lam} dct_q={dct_q}: "
                   f"PSNR={entry['psnr']:.2f} SSIM={entry['ssim']:.4f} bpp={entry['bpp']:.3f}")
     return results
+
+def knee_dist(rows):
+    bpp = np.array([r['bpp'] for r in rows], dtype=float)
+    psnr = np.array([r['psnr'] for r in rows], dtype=float)
+    x = (bpp - bpp.min()) / max(bpp.max() - bpp.min(), 1e-12)
+    y = (psnr - psnr.min()) / max(psnr.max() - psnr.min(), 1e-12)
+    slope = (y[-1] - y[0]) / max(x[-1] - x[0], 1e-12)
+    return y - (y[0] + slope * (x - x[0]))
+
+def select_lambda(config_nat, config_svg, val_nat, val_svg, lam_grid, dct_quality=35):
+    rd_nat = run_rd_sweep(val_nat, config_nat, lam_grid, [dct_quality])
+    rd_svg = run_rd_sweep(val_svg, config_svg, lam_grid, [dct_quality])
+
+    mean_dist = (knee_dist(rd_nat) + knee_dist(rd_svg)) / 2
+    best_i = int(np.argmax(mean_dist))
+
+    print("\nLambda selection (mean knee distance over categories):")
+    for i, lam in enumerate(lam_grid):
+        dct_pct_nat = 100 * rd_nat[i]['tier_bytes'][2] / max(sum(rd_nat[i]['tier_bytes']), 1)
+        dct_pct_svg = 100 * rd_svg[i]['tier_bytes'][2] / max(sum(rd_svg[i]['tier_bytes']), 1)
+        mark = '  <- selected' if i == best_i else ''
+        print(f"  lam={lam:>6}  nat: bpp={rd_nat[i]['bpp']:.3f} psnr={rd_nat[i]['psnr']:.2f} DCT%bytes={dct_pct_nat:.1f}   "
+              f"svg: bpp={rd_svg[i]['bpp']:.3f} psnr={rd_svg[i]['psnr']:.2f} DCT%bytes={dct_pct_svg:.1f}{mark}")
+    if best_i in (0, len(lam_grid) - 1):
+        print("  WARNING: selected lambda is at the edge of the grid")
+    return lam_grid[best_i]
 
 def encode_raster_baseline(images, codec, qualities):
     flag = cv2.IMWRITE_JPEG_QUALITY if codec == 'jpeg' else cv2.IMWRITE_WEBP_QUALITY
@@ -2541,13 +2631,14 @@ def write_boundary_report(bnd_natural, bnd_structured, table_dir='paper_tables')
             f.write(f"\n{label}:\n")
             methods = list(d['byte_matched'].keys())
             byte_budgets = sorted(d['byte_matched'][methods[0]].keys())
-            for metric in ['n', 'mae', 'psnr', 'ssim']:
+            for metric in ['n', 'mae', 'psnr', 'ssim', 'iou', 'chamfer']:
+                prec = 1 if metric == 'n' else 4
                 f.write(f"\n  {metric.upper()}\n")
                 f.write(f"  {'Budget':>8}" + "".join(f"{m:>14}" for m in methods) + "\n")
                 for B in byte_budgets:
                     row = f"  {B:>8}"
                     for m in methods:
-                        row += f"{d['byte_matched'][m][B][metric]:>14.1f}"
+                        row += f"{d['byte_matched'][m][B][metric]:>14.{prec}f}"
                     f.write(row + "\n")
 
     with open(os.path.join(table_dir, 'table_viii.txt'), 'w') as f:
@@ -2557,32 +2648,42 @@ def write_boundary_report(bnd_natural, bnd_structured, table_dir='paper_tables')
             methods = list(d['param_matched'].keys())
             budgets = sorted(d['param_matched'][methods[0]].keys())
             byte_budgets = sorted(d['byte_matched'][methods[0]].keys())
-            f.write("\n  Parameter-matched (fail/total)\n")
-            f.write(f"  {'N':>6}" + "".join(f"{m:>14}" for m in methods) + "\n")
+            f.write("\n  Parameter-matched (fail/qualified, of total)\n")
+            f.write(f"  {'N':>6}{'Total':>8}" + "".join(f"{m:>16}" for m in methods) + "\n")
             for n in budgets:
-                row = f"  {n:>6}"
+                total = d['param_matched'][methods[0]][n]['total_count']
+                row = f"  {n:>6}{total:>8}"
                 for m in methods:
                     fail = d['param_matched'][m][n]['fail_count']
-                    total = d['param_matched'][m][n]['total_count']
-                    row += f"{fail:>7}/{total:<6}"
+                    qual = d['param_matched'][m][n]['qualified_count']
+                    row += f"{fail:>7}/{qual:<8}"
                 f.write(row + "\n")
-            f.write("\n  Byte-matched (fail/total)\n")
-            f.write(f"  {'Budget':>8}" + "".join(f"{m:>14}" for m in methods) + "\n")
+            f.write("\n  Byte-matched (fail/qualified, of total)\n")
+            f.write(f"  {'Budget':>8}{'Total':>8}" + "".join(f"{m:>16}" for m in methods) + "\n")
             for B in byte_budgets:
-                row = f"  {B:>8}"
+                total = d['byte_matched'][methods[0]][B]['total_count']
+                row = f"  {B:>8}{total:>8}"
                 for m in methods:
                     fail = d['byte_matched'][m][B]['fail_count']
-                    total = d['byte_matched'][m][B]['total_count']
-                    row += f"{fail:>7}/{total:<6}"
+                    qual = d['byte_matched'][m][B]['qualified_count']
+                    row += f"{fail:>7}/{qual:<8}"
                 f.write(row + "\n")
+
 def write_decomposition_report(decomp_natural, decomp_structured, table_dir='paper_tables'):
     os.makedirs(table_dir, exist_ok=True)
     with open(os.path.join(table_dir, 'table_v.txt'), 'w') as f:
         f.write("TABLE V - Error decomposition\n")
+        cond_names = {'A': 'A exact+mean', 'B': 'B spline+mean', 'C': 'C exact+original',
+                      'D': 'D exact+planar', 'E': 'E spline+planar', 'F': 'F spline+original'}
         for label, d in [('Natural', decomp_natural), ('Structured', decomp_structured)]:
             f.write(f"\n{label}:\n")
-            for k, v in d.items():
-                f.write(f"  {k:8s} = {v:.4f}\n")
+            f.write(f"\n  {'Condition':<20}{'PSNR':>8}{'SSIM':>8}{'LPIPS':>8}{'bMAE':>8}{'bPSNR':>8}{'bSSIM':>8}{'iMAE':>8}{'iPSNR':>8}{'iSSIM':>8}\n")
+            for cond, name in cond_names.items():
+                m = d['conditions'][cond]
+                f.write(f"  {name:<20}{m['full_psnr']:>8.4f}{m['full_ssim']:>8.4f}{m['full_lpips']:>8.4f}"
+                        f"{m['b_mae']:>8.4f}{m['b_psnr']:>8.4f}{m['b_ssim']:>8.4f}"
+                        f"{m['i_mae']:>8.4f}{m['i_psnr']:>8.4f}{m['i_ssim']:>8.4f}\n")
+            f.write(f"\n  dseg={d['dseg']:.4f}  dbnd={d['dbnd']:.4f}  dapp={d['dapp']:.4f}  dint={d['dint']:.4f}  dE={d['dE']:.4f}\n")
 
 def write_mode_report(mode_natural, mode_structured, table_dir='paper_tables'):
     os.makedirs(table_dir, exist_ok=True)
@@ -2630,13 +2731,15 @@ warnings.filterwarnings("ignore")
 if __name__ == '__main__':
 
     # Load all images
-    tune_images, stability_images = load_disjoint_splits('BSDS500/val', [15, 30], seed=42)
-    val_svgs, test_svgs = load_disjoint_splits('svgs', [15, 30], seed=42)
-    kodak_images = [os.path.join('kodak', f) for f in sorted(os.listdir('kodak'))]
+    splits = load_splits()
+    tune_images, val_images = splits['natural']['tune'], splits['natural']['val']
+    tune_svgs, val_svgs, test_svgs = splits['structured']['tune'], splits['structured']['val'], splits['structured']['test']
+    test_images = [os.path.join('kodak', f) for f in sorted(os.listdir('kodak'))]
 
     # Read in hyperparameters
     config_bsds = json.load(open('tuned_config.json'))['natural']
     config_svg = json.load(open('tuned_config.json'))['structured']
+    RD_LAMBDA = select_lambda(config_bsds, config_svg, val_images, val_svgs, lam_grid=[10, 30, 60, 100, 200, 400, 700, 1000])
 
     # Set up figure formatting
     FIGURE_DIR = 'paper_figures'
@@ -2648,17 +2751,17 @@ if __name__ == '__main__':
 
     # ===== Run final end-to-end pipeline ===== 
     print("\nBSDS final:")
-    run_final_test(kodak_images, config_bsds)
+    run_final_test(test_images, config_bsds)
     print("\nStructured final:")
     run_final_test(test_svgs, config_svg)
 
     # ===== v7.2 Testing ===== 
-    decomp_natural = aggregate_decomposition(kodak_images, config_bsds, 'Natural')
+    decomp_natural = aggregate_decomposition(test_images, config_bsds, 'Natural')
     decomp_structured = aggregate_decomposition(test_svgs, config_svg, 'Structured')
     write_decomposition_report(decomp_natural, decomp_structured)
-
+    
     # ===== v7.3 Testing ===== 
-    bnd_natural = aggregate_boundary_comparison(kodak_images, config_bsds, 'Natural')
+    bnd_natural = aggregate_boundary_comparison(test_images, config_bsds, 'Natural')
     bnd_structured = aggregate_boundary_comparison(test_svgs, config_svg, 'Structured')
     plot_boundary_fig1(bnd_natural, savepath='paper_figures/fig1_boundary_natural.svg')
     plot_boundary_fig1(bnd_structured, savepath='paper_figures/fig1_boundary_structured.svg')
@@ -2671,14 +2774,14 @@ if __name__ == '__main__':
     dct_q_grid = [25, 35, 50]
     
     print("\nR-D sweep (natural):")
-    rd_natural = run_rd_sweep(kodak_images, config_bsds, lam_grid_final, dct_q_grid, lpips_fn=lp_fn)
+    rd_natural = run_rd_sweep(test_images, config_bsds, lam_grid_final, dct_q_grid, lpips_fn=lp_fn)
     print("\nR-D sweep (structured):")
     rd_structured = run_rd_sweep(test_svgs, config_svg, lam_grid_final, dct_q_grid, lpips_fn=lp_fn)
     
     jpeg_q = [10, 20, 30, 50, 70, 85, 95]
     webp_q = [10, 20, 30, 50, 70, 85, 95]
-    jpeg_natural    = encode_raster_baseline(kodak_images, 'jpeg', jpeg_q)
-    webp_natural    = encode_raster_baseline(kodak_images, 'webp', webp_q)
+    jpeg_natural    = encode_raster_baseline(test_images, 'jpeg', jpeg_q)
+    webp_natural    = encode_raster_baseline(test_images, 'webp', webp_q)
     jpeg_structured = encode_raster_baseline(test_svgs,   'jpeg', jpeg_q)
     webp_structured = encode_raster_baseline(test_svgs,   'webp', webp_q)
     
@@ -2699,24 +2802,24 @@ if __name__ == '__main__':
     tau_sweep_svg = [5, 10, 14, 17, 20, 23, 25, 28, 30]
 
     print("\nThreshold sweep (natural):")
-    thresh_grid_natural = run_threshold_sweep(stability_images[:8], sc_sweep_natural, tau_sweep_natural, config_bsds)
+    thresh_grid_natural = run_threshold_sweep(val_images[:8], sc_sweep_natural, tau_sweep_natural, config_bsds)
     plot_threshold_sweep(thresh_grid_natural, sc_sweep_natural, tau_sweep_natural, savepath='paper_figures/fig2_threshold_natural.svg')
     print("\nThreshold sweep (structured):")
     thresh_grid_svg = run_threshold_sweep(val_svgs[:8], sc_sweep_svg, tau_sweep_svg, config_svg)
     plot_threshold_sweep(thresh_grid_svg, sc_sweep_svg, tau_sweep_svg, savepath='paper_figures/fig2_threshold_structured.svg')
     
     # Table IX
-    mode_natural = report_mode_allocation(kodak_images, config_bsds, rd_lambda=100, label='Natural')
-    mode_structured = report_mode_allocation(test_svgs, config_svg, rd_lambda=100, label='Structured')
+    mode_natural = report_mode_allocation(test_images, config_bsds, rd_lambda=RD_LAMBDA, label='Natural')
+    mode_structured = report_mode_allocation(test_svgs, config_svg, rd_lambda=RD_LAMBDA, label='Structured')
     write_mode_report(mode_natural, mode_structured)
     
     # Table X
-    diag_natural = report_diagnostics(kodak_images, config_bsds, rd_lambda=100, label='Natural')
-    diag_structured = report_diagnostics(test_svgs, config_svg, rd_lambda=100, label='Structured')
+    diag_natural = report_diagnostics(test_images, config_bsds, rd_lambda=RD_LAMBDA, label='Natural')
+    diag_structured = report_diagnostics(test_svgs, config_svg, rd_lambda=RD_LAMBDA, label='Structured')
     write_diagnostics_report(diag_natural, diag_structured)
     
     # Timing experiment for Fig 4
-    timing_images = kodak_images[:6]
+    timing_images = test_images[:6]
     scales = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
     print("\nTiming experiment (natural):")
     timing_natural = run_timing_experiment(timing_images, scales, config_bsds)
@@ -2724,8 +2827,16 @@ if __name__ == '__main__':
     print("\nTiming experiment (structured):")
     timing_structured = run_timing_experiment(test_svgs[:6], scales, config_svg)
     plot_timing(timing_structured, savepath='paper_figures/fig4_timing_structured.svg')
-
+    
+    # Script statistics
     elapsed = time.time() - run_start
     h, rem = divmod(elapsed, 3600)
     m, s = divmod(rem, 60)
     print(f"Run finished at {time.strftime('%Y-%m-%d %H:%M:%S')} - total elapsed: {int(h)}h {int(m)}m {int(s)}s")
+
+    # Convert SVG images to PDF
+    os.makedirs('paper_figures_pdf', exist_ok=True)
+    for f in sorted(glob.glob('paper_figures/*.svg')):
+        out = os.path.join('paper_figures_pdf', os.path.splitext(os.path.basename(f))[0] + '.pdf')
+        cairosvg.svg2pdf(url=f, write_to=out)
+        print(out)
