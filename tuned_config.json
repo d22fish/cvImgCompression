@@ -2,11 +2,11 @@
   "natural": {
     "sigmaColor": 200,
     "sigmaSpace": 20,
-    "high_thresh": 130,
+    "high_thresh": 200,
     "low_thresh": 0.3,
     "spline_min_smooth": 0.0,
     "spline_max_smooth": 10.5,
-    "spline_base_perim": 200,
+    "spline_base_perim": 200.0,
     "complexity_weights": [
       0.3,
       0.7
@@ -16,11 +16,11 @@
   "structured": {
     "sigmaColor": 50,
     "sigmaSpace": 80,
-    "high_thresh": 20,
+    "high_thresh": 20.0,
     "low_thresh": 0.0,
-    "spline_min_smooth": 2,
+    "spline_min_smooth": 2.0,
     "spline_max_smooth": 18.0,
-    "spline_base_perim": 260,
+    "spline_base_perim": 260.0,
     "complexity_weights": [
       0.4,
       0.6

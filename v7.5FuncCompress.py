@@ -29,6 +29,8 @@ import time
 import json
 import cairosvg
 import glob
+from compressai.zoo import bmshj2018_hyperprior
+_LEARNED_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # %%
 ########### v7.2 ablation study #############
@@ -982,7 +984,7 @@ def poly_at_n(contour, n, H, W, deg=3):
         t  = np.linspace(0.0, 1.0, len(seg))
         tt = np.linspace(0.0, 1.0, max(12, len(seg) * 2))
         with warnings.catch_warnings():
-            warnings.simplefilter('ignore', np.exceptions.RankWarning)
+            warnings.simplefilter('ignore', _RankWarning)
             pr = np.poly1d(np.polyfit(t, rows, deg))
             pc = np.poly1d(np.polyfit(t, cols, deg))
         for r, c in zip(pr(tt), pc(tt)):
@@ -2496,17 +2498,54 @@ def encode_raster_baseline(images, codec, qualities):
         })
     return results
 
+def encode_learned_baseline(images, qualities):
+    results = []
+    for q in qualities:
+        net = bmshj2018_hyperprior(quality=q, metric='mse', pretrained=True).eval().to(_LEARNED_DEVICE)
+        net.update(force=True)
+        scores = []
+        with torch.no_grad():
+            for p in images:
+                img_bgr = cv2.imread(p)
+                orig_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                H, W = orig_rgb.shape[:2]
+                x = torch.from_numpy(orig_rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(_LEARNED_DEVICE)
+                pad_h = (64 - H % 64) % 64
+                pad_w = (64 - W % 64) % 64
+                x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
+                enc = net.compress(x)
+                dec = net.decompress(enc['strings'], enc['shape'])
+                x_hat = dec['x_hat'][:, :, :H, :W].clamp(0, 1)
+                rec_rgb = (x_hat.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
+                n_bytes = sum(len(s[0]) for s in enc['strings'])
+                full = np.ones((H, W), dtype=bool)
+                scores.append({
+                    'psnr': masked_psnr(orig_rgb, rec_rgb, full),
+                    'ssim': masked_ssim(orig_rgb, rec_rgb, full),
+                    'lpips': compute_lpips(orig_rgb, rec_rgb),
+                    'bpp':  n_bytes * 8 / (H * W),
+                })
+        results.append({
+            'quality': q,
+            'bpp':  np.mean([s['bpp']  for s in scores]),
+            'psnr': np.mean([s['psnr'] for s in scores]),
+            'ssim': np.mean([s['ssim'] for s in scores]),
+            'lpips': np.mean([s['lpips'] for s in scores]),
+        })
+    return results
+
 def plot_rd_curves(ours, baselines, metric='psnr', savepath=None):
     ylabel = {'psnr': 'PSNR (dB)', 'ssim': 'SSIM', 'lpips': 'LPIPS'}[metric]
     fig, ax = plt.subplots(figsize=(7, 5))
     pts = sorted(ours, key=lambda r: r['bpp'])
     ax.plot([r['bpp'] for r in pts], [r[metric] for r in pts], marker='o', label='Ours', linewidth=2)
-    styles = {'jpeg': ('darkorange', '--'), 'webp': ('forestgreen', '--'), 'png': ('steelblue', ':')}
+    styles = {'jpeg': ('darkorange', '--'), 'webp': ('forestgreen', '--'), 'png': ('steelblue', ':'), 'balle': ('crimson', '-.')}
+    disp = {'balle': 'Ballé'}
     for label, data in baselines.items():
         pts_b = sorted(data, key=lambda r: r['bpp'])
         color, ls = styles.get(label, ('gray', '--'))
         ax.plot([r['bpp'] for r in pts_b], [r[metric] for r in pts_b],
-                marker='s', label=label.upper(), color=color, linestyle=ls, linewidth=2)
+                marker='s', label=disp.get(label, label.upper()), color=color, linestyle=ls, linewidth=2)
     ax.set_xlabel('Bits per pixel (bpp)')
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
@@ -2516,7 +2555,6 @@ def plot_rd_curves(ours, baselines, metric='psnr', savepath=None):
     if savepath:
         plt.savefig(savepath, format='svg', bbox_inches='tight')
     return fig, ax
-
 
 def run_threshold_sweep(images, sc_vals, tau_vals, base_config):
     grid = {}
@@ -2721,8 +2759,12 @@ def write_diagnostics_report(diag_natural, diag_structured, table_dir='paper_tab
 # Hyperparameter Tuning
 
 # %%
+try:
+    _RankWarning = np.exceptions.RankWarning
+except AttributeError:
+    _RankWarning = np.RankWarning
 with warnings.catch_warnings():
-    warnings.simplefilter('ignore', np.exceptions.RankWarning)
+    warnings.simplefilter('ignore', _RankWarning)
     warnings.simplefilter('ignore', UserWarning)
     lpips_fn = lpips.LPIPS(net='alex', verbose=False)
 
@@ -2756,6 +2798,7 @@ if __name__ == '__main__':
     run_final_test(test_svgs, config_svg)
 
     # ===== v7.2 Testing ===== 
+    """
     decomp_natural = aggregate_decomposition(test_images, config_bsds, 'Natural')
     decomp_structured = aggregate_decomposition(test_svgs, config_svg, 'Structured')
     write_decomposition_report(decomp_natural, decomp_structured)
@@ -2766,7 +2809,7 @@ if __name__ == '__main__':
     plot_boundary_fig1(bnd_natural, savepath='paper_figures/fig1_boundary_natural.svg')
     plot_boundary_fig1(bnd_structured, savepath='paper_figures/fig1_boundary_structured.svg')
     write_boundary_report(bnd_natural, bnd_structured)
-    
+    """
     # ===== v7.4 Testing ===== 
     # R-D sweep — sweep lambda with fixed dct_quality; adjust ranges after lambda calibration
     lp_fn = lpips.LPIPS(net='alex', verbose=False)
@@ -2780,21 +2823,24 @@ if __name__ == '__main__':
     
     jpeg_q = [10, 20, 30, 50, 70, 85, 95]
     webp_q = [10, 20, 30, 50, 70, 85, 95]
+    balle_q = [1, 2, 3, 4, 5, 6, 7, 8]
     jpeg_natural    = encode_raster_baseline(test_images, 'jpeg', jpeg_q)
     webp_natural    = encode_raster_baseline(test_images, 'webp', webp_q)
     jpeg_structured = encode_raster_baseline(test_svgs,   'jpeg', jpeg_q)
     webp_structured = encode_raster_baseline(test_svgs,   'webp', webp_q)
+    balle_natural    = encode_learned_baseline(test_images, balle_q)
+    balle_structured = encode_learned_baseline(test_svgs,   balle_q)
     
     print("\nR-D curves (natural):")
-    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='psnr', savepath='paper_figures/fig3_rd_natural_psnr.svg')
-    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='ssim', savepath='paper_figures/fig3_rd_natural_ssim.svg')
-    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural}, metric='lpips', savepath='paper_figures/fig3_rd_natural_lpips.svg')
+    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural, 'balle': balle_natural}, metric='psnr', savepath='paper_figures/fig3_rd_natural_psnr.svg')
+    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural, 'balle': balle_natural}, metric='ssim', savepath='paper_figures/fig3_rd_natural_ssim.svg')
+    plot_rd_curves(rd_natural, {'jpeg': jpeg_natural, 'webp': webp_natural, 'balle': balle_natural}, metric='lpips', savepath='paper_figures/fig3_rd_natural_lpips.svg')
     
     print("\nR-D curves (structured):")
-    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='psnr', savepath='paper_figures/fig3_rd_structured_psnr.svg')
-    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='ssim', savepath='paper_figures/fig3_rd_structured_ssim.svg')
-    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured}, metric='lpips', savepath='paper_figures/fig3_rd_structured_lpips.svg')
-    
+    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured, 'balle': balle_structured}, metric='psnr', savepath='paper_figures/fig3_rd_structured_psnr.svg')
+    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured, 'balle': balle_structured}, metric='ssim', savepath='paper_figures/fig3_rd_structured_ssim.svg')
+    plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured, 'balle': balle_structured}, metric='lpips', savepath='paper_figures/fig3_rd_structured_lpips.svg')
+    """
     # Threshold sweep for Fig 2 — run on stability set (disjoint from test)
     sc_sweep_natural  = [250, 300, 350, 400, 450]
     tau_sweep_natural = [10, 30, 60, 90, 120, 150, 180, 200, 250]
@@ -2827,7 +2873,7 @@ if __name__ == '__main__':
     print("\nTiming experiment (structured):")
     timing_structured = run_timing_experiment(test_svgs[:6], scales, config_svg)
     plot_timing(timing_structured, savepath='paper_figures/fig4_timing_structured.svg')
-    
+    """
     # Script statistics
     elapsed = time.time() - run_start
     h, rem = divmod(elapsed, 3600)
