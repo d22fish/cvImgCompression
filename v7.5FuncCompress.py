@@ -527,7 +527,7 @@ def run_boundary_comparison(image_path, config):
                                             high_thresh=config['high_thresh'], low_thresh=config['low_thresh'])
         filtered = cv2.bilateralFilter(chosenImage, d=7, sigmaColor=config['sigmaColor'], sigmaSpace=config['sigmaSpace'])
         imgClusters, edgesSorted = run_segmentation(filtered, thresh)
-        img = cv2.cvtColor(filtered, cv2.COLOR_BGR2LAB).astype(float)
+        img = cv2.cvtColor(chosenImage, cv2.COLOR_BGR2LAB).astype(float)
         H, W = img.shape[:2]
         min_area = 50.0
 
@@ -543,23 +543,28 @@ def run_boundary_comparison(image_path, config):
 
         iou_scores = {m: {n: [] for n in budgets} for m in methods}
         chamfer_scores = {m: {n: [] for n in budgets} for m in methods}
-        for x_list, y_list in edgesSorted:
+        failCounts = {m: {n: 0 for n in budgets} for m in methods}
+        eligibleCount = 0
+        comparedIds = {n: [] for n in budgets}
+        for i, (x_list, y_list) in enumerate(edgesSorted):
             contour = enforce_closed_contour_rc(x_list, y_list)
             if len(contour) < 8 or contour_area_rc(contour) < min_area or (len(contour) - 1) < max(budgets):
                 continue
-            cache, ok = {}, True
+            eligibleCount += 1
             for n in budgets:
+                cache, ok = {}, True
                 for name, fn in methods.items():
                     pts = fn(contour, n, H, W)
                     if pts is None or len(pts) < 3:
                         ok = False
-                    cache[(n, name)] = pts
-            if ok:
-                for n in budgets:
+                        failCounts[name][n] += 1
+                    cache[name] = pts
+                # Keep a contour at this budget only when every method fits it
+                if ok:
+                    comparedIds[n].append(i + 1)
                     for name in methods:
-                        iou_scores[name][n].append(contour_iou(H, W, cache[(n, name)], contour))
-                        chamfer_scores[name][n].append(symmetric_chamfer(cache[(n, name)], contour))
-
+                        iou_scores[name][n].append(contour_iou(H, W, cache[name], contour))
+                        chamfer_scores[name][n].append(symmetric_chamfer(cache[name], contour))
         for m in methods:
             for n in budgets:
                 result['param_matched'][m][n]['iou'] = float(np.mean(iou_scores[m][n])) if iou_scores[m][n] else np.nan
@@ -567,45 +572,57 @@ def run_boundary_comparison(image_path, config):
 
         for m, fn in methods.items():
             for n in budgets:
-                rec_rgb, fail_n, total_n, qualified_n = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
-                result['param_matched'][m][n]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
-                result['param_matched'][m][n]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
-                result['param_matched'][m][n]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
-                result['param_matched'][m][n]['fail_count'] = fail_n
+                rec_rgb, total_n = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, comparedIds[n], comp_path)
+                # Score the band only inside regions compared at this budget
+                scored = band_mask & np.isin(imgClusters, comparedIds[n])
+                result['param_matched'][m][n]['mae'] = masked_mae(orig_rgb, rec_rgb, scored)
+                result['param_matched'][m][n]['psnr'] = masked_psnr(orig_rgb, rec_rgb, scored)
+                result['param_matched'][m][n]['ssim'] = masked_ssim(orig_rgb, rec_rgb, scored)
+                result['param_matched'][m][n]['fail_count'] = failCounts[m][n]
                 result['param_matched'][m][n]['total_count'] = total_n
-                result['param_matched'][m][n]['qualified_count'] = qualified_n
+                result['param_matched'][m][n]['qualified_count'] = eligibleCount
+                result['param_matched'][m][n]['compared_count'] = len(comparedIds[n])
 
         n_at = {B: {m: max_n_for_bytes(m, B) for m in methods} for B in byte_budgets}
         iou_scores_B = {m: {B: [] for B in byte_budgets} for m in methods}
         chamfer_scores_B = {m: {B: [] for B in byte_budgets} for m in methods}
+        failCountsB = {m: {B: 0 for B in byte_budgets} for m in methods}
+        eligibleCountB = 0
+        comparedIdsB = {B: [] for B in byte_budgets}
         max_n_needed = max(n_at[B][m] for B in byte_budgets for m in methods if n_at[B][m] is not None)
-        for x_list, y_list in edgesSorted:
+        for i, (x_list, y_list) in enumerate(edgesSorted):
             contour = enforce_closed_contour_rc(x_list, y_list)
             if len(contour) < 8 or contour_area_rc(contour) < min_area or (len(contour) - 1) < max_n_needed:
                 continue
+            eligibleCountB += 1
             for B in byte_budgets:
                 cache, ok = {}, True
                 for name, fn in methods.items():
-                    n = n_at[B][name]
-                    pts = fn(contour, n, H, W)
+                    pts = fn(contour, n_at[B][name], H, W)
                     if pts is None or len(pts) < 3:
                         ok = False
+                        failCountsB[name][B] += 1
                     cache[name] = pts
+                # Keep a contour at this budget only when every method fits it
                 if ok:
+                    comparedIdsB[B].append(i + 1)
                     for name in methods:
                         iou_scores_B[name][B].append(contour_iou(H, W, cache[name], contour))
                         chamfer_scores_B[name][B].append(symmetric_chamfer(cache[name], contour))
         for B in byte_budgets:
+            # Score the band only inside regions compared at this budget
+            scoredB = band_mask & np.isin(imgClusters, comparedIdsB[B])
             for m, fn in methods.items():
                 n = n_at[B][m]
-                rec_rgb, fail_B, total_B, qualified_B = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, min_area, comp_path)
+                rec_rgb, total_B = compress_fixed_n(fn, n, img, imgClusters, edgesSorted, comparedIdsB[B], comp_path)
                 result['byte_matched'][m][B]['n'] = n
-                result['byte_matched'][m][B]['mae'] = masked_mae(orig_rgb, rec_rgb, band_mask)
-                result['byte_matched'][m][B]['psnr'] = masked_psnr(orig_rgb, rec_rgb, band_mask)
-                result['byte_matched'][m][B]['ssim'] = masked_ssim(orig_rgb, rec_rgb, band_mask)
-                result['byte_matched'][m][B]['fail_count'] = fail_B
+                result['byte_matched'][m][B]['mae'] = masked_mae(orig_rgb, rec_rgb, scoredB)
+                result['byte_matched'][m][B]['psnr'] = masked_psnr(orig_rgb, rec_rgb, scoredB)
+                result['byte_matched'][m][B]['ssim'] = masked_ssim(orig_rgb, rec_rgb, scoredB)
+                result['byte_matched'][m][B]['fail_count'] = failCountsB[m][B]
                 result['byte_matched'][m][B]['total_count'] = total_B
-                result['byte_matched'][m][B]['qualified_count'] = qualified_B
+                result['byte_matched'][m][B]['qualified_count'] = eligibleCountB
+                result['byte_matched'][m][B]['compared_count'] = len(comparedIdsB[B])
                 result['byte_matched'][m][B]['iou'] = float(np.mean(iou_scores_B[m][B])) if iou_scores_B[m][B] else np.nan
                 result['byte_matched'][m][B]['chamfer'] = float(np.mean(chamfer_scores_B[m][B])) if chamfer_scores_B[m][B] else np.nan
         return result
@@ -613,11 +630,10 @@ def run_boundary_comparison(image_path, config):
         if os.path.exists(comp_path):
             os.remove(comp_path)
 
-
-def compress_fixed_n(fit_fn, n, img, imgClusters, edgesSorted, min_area, path):
-    fail_count = 0
+# Encode each region with a planar interior, fitting compared boundaries with fit_fn and keeping the exact outline for the rest.
+def compress_fixed_n(fit_fn, n, img, imgClusters, edgesSorted, compared_ids, path):
+    comparedSet = set(compared_ids)
     total_count = 0
-    qualified_count = 0
     with open(path, 'w') as f:
         for i, (x_list, y_list) in enumerate(edgesSorted):
             contour = enforce_closed_contour_rc(x_list, y_list)
@@ -631,25 +647,17 @@ def compress_fixed_n(fit_fn, n, img, imgClusters, edgesSorted, min_area, path):
             m1 = ','.join(f'{v:.6f}' for v in coef[1])
             m2 = ','.join(f'{v:.6f}' for v in coef[2])
             f.write(f'M;{xc:.4f},{yc:.4f};{m0};{m1};{m2};\n')
-            pts = None
-            qualifies = len(contour) >= 8 and contour_area_rc(contour) >= min_area and (len(contour) - 1) >= n
-            if len(contour) >= 8 and contour_area_rc(contour) >= min_area and (len(contour) - 1) >= n:
-                qualified_count += 1
-                pts = fit_fn(contour, n, img.shape[0], img.shape[1])
-            if pts is None or len(pts) < 3:
-                pts = subsample_to_n(contour, n)
-                if qualifies:
-                    fail_count += 1
+            # Regions outside the comparison keep their exact outline so every method draws them the same
+            pts = fit_fn(contour, n, img.shape[0], img.shape[1]) if cluster_id in comparedSet else contour
             payload = ';'.join(f'{float(r):.4f},{float(c):.4f}' for r, c in pts)
             f.write(f'L;{payload};\n\n')
     rec_lab = decode_planar_any_geometry(path, img.shape[:2])
     rec_rgb = cv2.cvtColor(rec_lab, cv2.COLOR_LAB2RGB)
-    return rec_rgb, fail_count, total_count, qualified_count
+    return rec_rgb, total_count
 
 def geom_bytes(method, n, k=3):
     if method == 'B-spline':
-        n_knots = n + k + 1
-        return 4 + n_knots * 2 + 2 + n * 4 * 2
+        return 4 + (n - 1) * 2 + 2 + n * 4 * 2
     elif method == 'Bezier':
         return 3 + n * 4 * 2
     elif method in ('Chebyshev', 'Polynomial'):
@@ -659,7 +667,7 @@ def geom_bytes(method, n, k=3):
 def max_n_for_bytes(method, budget):
     for n in range(60, 3, -1):
         if geom_bytes(method, n) <= budget:
-            return n
+            return 4 * (n // 4) if method in ('Chebyshev', 'Polynomial') else n
     return None
 
 def decode_planar_any_geometry(imComp_path, shape_hw):
@@ -932,7 +940,7 @@ def bspline_at_n(contour, n_target, H, W, max_iter=40):
         except Exception:
             s_hi = s_mid
             continue
-        n_ctrl = len(tck[1][0])
+        n_ctrl = len(tck[1][0]) - 3
         gap = abs(n_ctrl - n_target)
         if gap < best_gap:
             best_tck, best_gap = tck, gap
@@ -942,9 +950,9 @@ def bspline_at_n(contour, n_target, H, W, max_iter=40):
             s_hi = s_mid
         else:
             break
-    if best_tck is None or best_gap > 2:
+    if best_tck is None or best_gap > 0:
         return None
-    n_ctrl = len(best_tck[1][0])
+    n_ctrl = len(best_tck[1][0]) - 3
     r, c = splev(np.linspace(0, 1, max(200, 4 * n_ctrl), endpoint=False), best_tck)
     return list(zip(r, c))
 
@@ -962,10 +970,11 @@ def chebyshev_at_n(contour, n, H, W, deg=3):
     base = contour[:-1] if contour[0] == contour[-1] else contour
     if len(base) < 4: return None
     n_segs  = max(1, n // (deg + 1))
-    seg_len = max(4, len(base) // n_segs)
+    bounds = np.linspace(0, len(base), n_segs + 1).astype(int)
+    ring = base + base[:1]
     fitted  = []
-    for s in range(0, len(base), seg_len):
-        seg = base[s : s + seg_len + 1]
+    for s, e in zip(bounds[:-1], bounds[1:]):
+        seg = ring[s : e + 1]
         if len(seg) < 4: continue
         fitted.extend(fit_param_segment(seg, H, W, deg=deg, n_out=max(12, len(seg)*2)))
     return fitted if len(fitted) >= 3 else None
@@ -974,10 +983,11 @@ def poly_at_n(contour, n, H, W, deg=3):
     base = contour[:-1] if contour[0] == contour[-1] else contour
     if len(base) < 4: return None
     n_segs  = max(1, n // (deg + 1))
-    seg_len = max(4, len(base) // n_segs)
+    bounds = np.linspace(0, len(base), n_segs + 1).astype(int)
+    ring = base + base[:1]
     fitted  = []
-    for s in range(0, len(base), seg_len):
-        seg = base[s : s + seg_len + 1]
+    for s, e in zip(bounds[:-1], bounds[1:]):
+        seg = ring[s : e + 1]
         if len(seg) < 4: continue
         rows = np.array([p[0] for p in seg], dtype=float)
         cols = np.array([p[1] for p in seg], dtype=float)
@@ -997,7 +1007,7 @@ def poly_at_n(contour, n, H, W, deg=3):
 # Rasterize both contours as filled polygons and compute pixel-level IoU
 def rasterize(pts_rc, H, W):
     mask = np.zeros((H, W), dtype=np.uint8)
-    arr = np.array([[c, r] for r, c in pts_rc], dtype=np.int32).reshape(-1, 1, 2)
+    arr = np.rint(np.array([[c, r] for r, c in pts_rc], dtype=np.float64)).astype(np.int32).reshape(-1, 1, 2)
     cv2.fillPoly(mask, [arr], 1)
     return mask
 
@@ -1036,13 +1046,13 @@ def aggregate_boundary_comparison(images, config, label):
     for m in methods:
         for n in budgets:
             for metric in results[0]['param_matched'][m][n]:
-                if metric in ('fail_count', 'total_count', 'qualified_count'):
+                if metric in ('fail_count', 'total_count', 'qualified_count', 'compared_count'):
                     avg['param_matched'][m][n][metric] = sum(r['param_matched'][m][n][metric] for r in results)
                 else:
                     avg['param_matched'][m][n][metric] = float(np.nanmean([r['param_matched'][m][n][metric] for r in results]))
         for B in byte_budgets:
             for metric in results[0]['byte_matched'][m][B]:
-                if metric in ('fail_count', 'total_count', 'qualified_count'):
+                if metric in ('fail_count', 'total_count', 'qualified_count', 'compared_count'):
                     avg['byte_matched'][m][B][metric] = sum(r['byte_matched'][m][B][metric] for r in results)
                 else:
                     avg['byte_matched'][m][B][metric] = float(np.nanmean([r['byte_matched'][m][B][metric] for r in results]))
@@ -2245,6 +2255,7 @@ def run_pipeline(image_path, sigmaColor=35, sigmaSpace=None,
     filtered = cv2.bilateralFilter(chosenImage, d=7, sigmaColor=sigmaColor, sigmaSpace=sigmaSpace)
 
     imgClusters, edgesSorted = run_segmentation(filtered, thresh) 
+    region_areas = np.array([(imgClusters == i + 1).sum() for i in range(len(edgesSorted))])
 
     # Stage 2 & 3: Encode with given parameters
     rec_rgb, file_size, CAST_LOG, diag = run_encode_decode(
@@ -2278,6 +2289,7 @@ def run_pipeline(image_path, sigmaColor=35, sigmaSpace=None,
         'bpp': file_size * 8 / (orig_rgb.shape[0] * orig_rgb.shape[1]),
         'thresh': thresh,
         'n_regions': len(edgesSorted),
+        'region_areas': region_areas,
         'lpips': lpips_val,
         'diag': diag,
     }
@@ -2346,6 +2358,13 @@ def run_final_test(test_images, config):
     print(f"\nFINAL TEST (n={len(test_images)}): PSNR={avg_psnr:.2f} SSIM={avg_ssim:.4f} bpp={avg_bpp:.3f}")
     return {'psnr': avg_psnr, 'ssim': avg_ssim, 'bpp': avg_bpp, 'per_image': scores}
 
+def regions_for_coverage(areas, fraction):
+    if len(areas) == 0:
+        return 0
+    areas_sorted = np.sort(areas)[::-1]
+    cum = np.cumsum(areas_sorted)
+    return int(np.searchsorted(cum, fraction * cum[-1]) + 1)
+
 def report_diagnostics(images, config, rd_lambda, label):
     cfg = dict(config)
     cfg['rd_lambda'] = rd_lambda
@@ -2359,6 +2378,8 @@ def report_diagnostics(images, config, rd_lambda, label):
     cov_repair_list = []
     cov_nearest_list = []
     overflow_pcts = []
+    coverage_fracs = [0.5, 0.8, 0.9, 1.0]
+    coverage_lists = {f: [] for f in coverage_fracs}         
 
     for path in images:
         result = run_pipeline(path, **cfg)
@@ -2370,6 +2391,10 @@ def report_diagnostics(images, config, rd_lambda, label):
         cov_raster_list.append(diag['cov_raster'])
         cov_repair_list.append(diag['cov_repair'])
         cov_nearest_list.append(diag['cov_nearest'])
+        for frac in coverage_fracs:                           
+            coverage_lists[frac].append(regions_for_coverage(result['region_areas'], frac))
+
+    coverage_avgs = {f: float(np.mean(v)) for f, v in coverage_lists.items()}
 
     print(f"\n{label} (lambda={rd_lambda}):")
     print(f"  Region count: initial={initial_total} encoded={encoded_total}")
@@ -2378,11 +2403,14 @@ def report_diagnostics(images, config, rd_lambda, label):
     print(f"  Coverage repair: raster={100*np.mean(cov_raster_list):.2f}% "
           f"final_after_dilation_convolution={100*np.mean(cov_repair_list):.2f}% "
           f"final_after_nearest={100*np.mean(cov_nearest_list):.2f}%")
+    print("  Regions for area coverage: " +                 
+          ", ".join(f"{int(f*100)}%={v:.1f}" for f, v in sorted(coverage_avgs.items())))
 
     return {
         'initial': initial_total, 'encoded': encoded_total, 'sl_ratio': sl_ratio,
         'cov_raster': np.mean(cov_raster_list), 'cov_repair': np.mean(cov_repair_list),
         'cov_nearest': np.mean(cov_nearest_list),
+        'coverage': coverage_avgs,                          
     }
 
 def report_mode_allocation(images, config, rd_lambda, label):
@@ -2593,27 +2621,34 @@ def plot_threshold_sweep(grid, sc_vals, tau_vals, savepath=None):
     if savepath:
         plt.savefig(savepath, format='svg', bbox_inches='tight')
 
-def plot_boundary_fig1(avg, savepath=None):
-    budgets = sorted(avg['param_matched'][next(iter(avg['param_matched']))].keys())
-    byte_budgets = sorted(avg['byte_matched'][next(iter(avg['byte_matched']))].keys())
-    colors = {'B-spline': 'steelblue', 'Bezier': 'darkorange', 'Chebyshev': 'forestgreen', 'Polynomial': 'crimson'}
-    plot_methods = [m for m in avg['param_matched'] if m != 'Polynomial']
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    for m in plot_methods:
-        psnr_by_n = [avg['param_matched'][m][n]['psnr'] for n in budgets]
-        ax1.plot(budgets, psnr_by_n, marker='o', label=m, color=colors[m], linewidth=2)
-
-        psnr_by_byte = [avg['byte_matched'][m][B]['psnr'] for B in byte_budgets]
-        ax2.plot(byte_budgets, psnr_by_byte, marker='o', label=m, color=colors[m], linewidth=2)
-
-    ax1.set(xlabel='Control points N', ylabel='Boundary-band PSNR', title='Matched parameter budget')
-    ax2.set(xlabel='Byte budget', ylabel='Boundary-band PSNR', title='Matched byte budget')
-    ax1.legend(); ax2.legend(); ax1.grid(True, alpha=0.3); ax2.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-    if savepath:
-        plt.savefig(savepath, format='svg', bbox_inches='tight')
+def plot_boundary_fig1(avg_nat, avg_str, savepath=None):
+    colors = {'B-spline': 'steelblue', 'Bezier': 'darkorange', 'Chebyshev': 'forestgreen'}
+    markers = {'B-spline': 'o', 'Bezier': 's', 'Chebyshev': '^'}
+    disp = {'Bezier': 'Bézier'}
+    style = {'font.size': 7, 'axes.titlesize': 7, 'axes.labelsize': 7, 'legend.fontsize': 7, 'xtick.labelsize': 6, 'ytick.labelsize': 6}
+    with plt.rc_context(style):
+        fig, axes = plt.subplots(2, 2, figsize=(3.5, 3.0), sharex='col')
+        for row, (label, avg) in enumerate([('Natural', avg_nat), ('Structured', avg_str)]):
+            methods = [m for m in avg['param_matched'] if m in colors]
+            budgets = sorted(avg['param_matched'][methods[0]].keys())
+            byte_budgets = sorted(avg['byte_matched'][methods[0]].keys())
+            for m in methods:
+                kw = dict(marker=markers[m], markersize=3, linewidth=1, color=colors[m], label=disp.get(m, m))
+                axes[row, 0].plot(budgets, [avg['param_matched'][m][n]['psnr'] for n in budgets], **kw)
+                axes[row, 1].plot(byte_budgets, [avg['byte_matched'][m][B]['psnr'] for B in byte_budgets], **kw)
+            axes[row, 0].set_ylabel(f'{label}\nBand PSNR (dB)')
+            for ax in axes[row]:
+                ax.grid(True, alpha=0.3)
+        axes[0, 0].set_title('Matched parameters')
+        axes[0, 1].set_title('Matched bytes')
+        axes[1, 0].set_xlabel('Shape parameters $N$')
+        axes[1, 1].set_xlabel('Byte budget (B)')
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc='upper center', ncol=3, frameon=False, bbox_to_anchor=(0.5, 1.02))
+        fig.tight_layout(rect=(0, 0, 1, 0.94))
+        if savepath:
+            fig.savefig(savepath, format='svg', bbox_inches='tight')
+        plt.close(fig)
 
 def run_timing_experiment(images, scales, config):
     tmp = '/tmp/_timing_img.png'
@@ -2686,21 +2721,23 @@ def write_boundary_report(bnd_natural, bnd_structured, table_dir='paper_tables')
             methods = list(d['param_matched'].keys())
             budgets = sorted(d['param_matched'][methods[0]].keys())
             byte_budgets = sorted(d['byte_matched'][methods[0]].keys())
-            f.write("\n  Parameter-matched (fail/qualified, of total)\n")
-            f.write(f"  {'N':>6}{'Total':>8}" + "".join(f"{m:>16}" for m in methods) + "\n")
+            f.write("\n  Parameter-matched (fail/qualified per method, total outlines, compared outlines)\n")
+            f.write(f"  {'N':>6}{'Total':>8}{'Compared':>10}" + "".join(f"{m:>16}" for m in methods) + "\n")
             for n in budgets:
                 total = d['param_matched'][methods[0]][n]['total_count']
-                row = f"  {n:>6}{total:>8}"
+                compared = d['param_matched'][methods[0]][n]['compared_count']
+                row = f"  {n:>6}{total:>8}{compared:>10}"
                 for m in methods:
                     fail = d['param_matched'][m][n]['fail_count']
                     qual = d['param_matched'][m][n]['qualified_count']
                     row += f"{fail:>7}/{qual:<8}"
                 f.write(row + "\n")
-            f.write("\n  Byte-matched (fail/qualified, of total)\n")
-            f.write(f"  {'Budget':>8}{'Total':>8}" + "".join(f"{m:>16}" for m in methods) + "\n")
+            f.write("\n  Byte-matched (fail/qualified per method, total outlines, compared outlines)\n")
+            f.write(f"  {'Budget':>8}{'Total':>8}{'Compared':>10}" + "".join(f"{m:>16}" for m in methods) + "\n")
             for B in byte_budgets:
                 total = d['byte_matched'][methods[0]][B]['total_count']
-                row = f"  {B:>8}{total:>8}"
+                compared = d['byte_matched'][methods[0]][B]['compared_count']
+                row = f"  {B:>8}{total:>8}{compared:>10}"
                 for m in methods:
                     fail = d['byte_matched'][m][B]['fail_count']
                     qual = d['byte_matched'][m][B]['qualified_count']
@@ -2752,6 +2789,8 @@ def write_diagnostics_report(diag_natural, diag_structured, table_dir='paper_tab
             f.write(f"  Coverage repair: raster={100*d['cov_raster']:.2f}% "
                     f"dilation/convolution={100*d['cov_repair']:.2f}% "
                     f"nearest={100*d['cov_nearest']:.2f}%\n")
+            f.write("  Regions for area coverage: " +            
+                     ", ".join(f"{int(fr*100)}%={v:.1f}" for fr, v in sorted(d['coverage'].items())) + "\n")
 
 ########### Plotting and outputs ###########s
 
@@ -2782,7 +2821,7 @@ if __name__ == '__main__':
     config_bsds = json.load(open('tuned_config.json'))['natural']
     config_svg = json.load(open('tuned_config.json'))['structured']
     RD_LAMBDA = select_lambda(config_bsds, config_svg, val_images, val_svgs, lam_grid=[10, 30, 60, 100, 200, 400, 700, 1000])
-
+    
     # Set up figure formatting
     FIGURE_DIR = 'paper_figures'
     os.makedirs(FIGURE_DIR, exist_ok=True)
@@ -2790,15 +2829,14 @@ if __name__ == '__main__':
 
     run_start = time.time()
     print(f"Run started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
+    """
     # ===== Run final end-to-end pipeline ===== 
     print("\nBSDS final:")
     run_final_test(test_images, config_bsds)
     print("\nStructured final:")
     run_final_test(test_svgs, config_svg)
-
-    # ===== v7.2 Testing ===== 
     """
+    # ===== v7.2 Testing ===== 
     decomp_natural = aggregate_decomposition(test_images, config_bsds, 'Natural')
     decomp_structured = aggregate_decomposition(test_svgs, config_svg, 'Structured')
     write_decomposition_report(decomp_natural, decomp_structured)
@@ -2806,12 +2844,11 @@ if __name__ == '__main__':
     # ===== v7.3 Testing ===== 
     bnd_natural = aggregate_boundary_comparison(test_images, config_bsds, 'Natural')
     bnd_structured = aggregate_boundary_comparison(test_svgs, config_svg, 'Structured')
-    plot_boundary_fig1(bnd_natural, savepath='paper_figures/fig1_boundary_natural.svg')
-    plot_boundary_fig1(bnd_structured, savepath='paper_figures/fig1_boundary_structured.svg')
+    plot_boundary_fig1(bnd_natural, bnd_structured, savepath='paper_figures/fig1_boundary.svg')
     write_boundary_report(bnd_natural, bnd_structured)
     """
     # ===== v7.4 Testing ===== 
-    # R-D sweep — sweep lambda with fixed dct_quality; adjust ranges after lambda calibration
+    # R-D sweep over lambda with fixed dct_quality; adjust ranges after lambda calibration
     lp_fn = lpips.LPIPS(net='alex', verbose=False)
     lam_grid_final = [10, 30, 60, 100, 200, 400, 700, 1000]
     dct_q_grid = [25, 35, 50]
@@ -2840,8 +2877,8 @@ if __name__ == '__main__':
     plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured, 'balle': balle_structured}, metric='psnr', savepath='paper_figures/fig3_rd_structured_psnr.svg')
     plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured, 'balle': balle_structured}, metric='ssim', savepath='paper_figures/fig3_rd_structured_ssim.svg')
     plot_rd_curves(rd_structured, {'jpeg': jpeg_structured, 'webp': webp_structured, 'balle': balle_structured}, metric='lpips', savepath='paper_figures/fig3_rd_structured_lpips.svg')
-    """
-    # Threshold sweep for Fig 2 — run on stability set (disjoint from test)
+    
+    # Threshold sweep for Fig 2 on stability set (disjoint from test)
     sc_sweep_natural  = [250, 300, 350, 400, 450]
     tau_sweep_natural = [10, 30, 60, 90, 120, 150, 180, 200, 250]
     sc_sweep_svg  = [55, 65, 75, 85, 95, 105]
@@ -2858,12 +2895,12 @@ if __name__ == '__main__':
     mode_natural = report_mode_allocation(test_images, config_bsds, rd_lambda=RD_LAMBDA, label='Natural')
     mode_structured = report_mode_allocation(test_svgs, config_svg, rd_lambda=RD_LAMBDA, label='Structured')
     write_mode_report(mode_natural, mode_structured)
-    
+    """
     # Table X
     diag_natural = report_diagnostics(test_images, config_bsds, rd_lambda=RD_LAMBDA, label='Natural')
     diag_structured = report_diagnostics(test_svgs, config_svg, rd_lambda=RD_LAMBDA, label='Structured')
     write_diagnostics_report(diag_natural, diag_structured)
-    
+    """
     # Timing experiment for Fig 4
     timing_images = test_images[:6]
     scales = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0]

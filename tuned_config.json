@@ -2,11 +2,11 @@
   "natural": {
     "sigmaColor": 200,
     "sigmaSpace": 20,
-    "high_thresh": 200,
+    "high_thresh": 270,
     "low_thresh": 0.3,
     "spline_min_smooth": 0.0,
     "spline_max_smooth": 10.5,
-    "spline_base_perim": 200.0,
+    "spline_base_perim": 160,
     "complexity_weights": [
       0.3,
       0.7
